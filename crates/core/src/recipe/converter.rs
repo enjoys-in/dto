@@ -87,19 +87,41 @@ fn mapping_to_field_schema(mapping: &FieldMapping) -> Result<FieldSchema, Recipe
 /// Splits an expression like `"user.name | trim | lowercase"` into path `"user.name"`
 /// and transform chain `"trim | lowercase"`.
 pub fn parse_source_and_transforms(source: &str) -> (String, Option<String>) {
-    if source.contains('|') {
-        let mut parts = source.split('|');
-        let path = parts.next().unwrap_or("").trim().to_string();
-        let tr: Vec<&str> = parts.map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-        let transforms = if tr.is_empty() {
-            None
-        } else {
-            Some(tr.join(" | "))
-        };
-        (path, transforms)
-    } else {
-        (source.to_string(), None)
+    match first_unquoted_pipe(source) {
+        Some(idx) => {
+            let path = source[..idx].trim().to_string();
+            let tr: Vec<&str> = source[idx + 1..]
+                .split('|')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let transforms = if tr.is_empty() {
+                None
+            } else {
+                Some(tr.join(" | "))
+            };
+            (path, transforms)
+        }
+        None => (source.to_string(), None),
     }
+}
+
+/// Byte index of the first `|` that is not inside a quoted key such as `["a|b"]`.
+fn first_unquoted_pipe(source: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in source.char_indices() {
+        match quote {
+            Some(_) if escaped => escaped = false,
+            Some(_) if c == '\\' => escaped = true,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '|' => return Some(i),
+            None => {}
+        }
+    }
+    None
 }
 
 /// Heuristic: infer a likely output type from the source path expression.

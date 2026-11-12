@@ -4,8 +4,19 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const STATUS_OK = 0;
+
+const toJsonBytes = (value) =>
+  encoder.encode(typeof value === 'string' ? value : JSON.stringify(value));
+
 /**
- * High-performance DTO data transformation engine powered by WebAssembly.
+ * DTO data transformation engine powered by WebAssembly.
+ *
+ * Use `compile(recipe)` once and call `.transform(data)` many times to avoid
+ * re-parsing the recipe on every call. `transform(recipe, data)` is a one-shot
+ * convenience that compiles, transforms and frees.
  */
 export class DTOEngine {
   constructor(wasmInstance) {
@@ -40,6 +51,20 @@ export class DTOEngine {
   }
 
   /**
+   * Compiles a Recipe, JSON Schema or pipeline once. Configuration errors
+   * (unknown functions, bad paths, ...) are thrown here.
+   *
+   * @param {object | string} schema - Recipe / JSON Schema / pipeline (object or JSON string).
+   * @returns {CompiledTransform} Call `.free()` when done.
+   */
+  compile(schema) {
+    const handle = this._withBytes(toJsonBytes(schema), (ptr, len) =>
+      this._readStatus(this.exports.dto_engine_new(ptr, len))
+    );
+    return new CompiledTransform(this, Number(handle));
+  }
+
+  /**
    * Transforms input JSON data according to the given Recipe or JSON Schema.
    *
    * @param {object | Array | string} schema - Recipe or JSON Schema (object or JSON string).
@@ -47,51 +72,85 @@ export class DTOEngine {
    * @returns {any} Transformed JavaScript object or array.
    */
   transform(schema, data) {
-    const schemaStr = typeof schema === 'string' ? schema : JSON.stringify(schema);
-    const dataStr = typeof data === 'string' ? data : JSON.stringify(data);
-
-    const encoder = new TextEncoder();
-    const decoder = new TextDecoder();
-
-    const schemaBytes = encoder.encode(schemaStr);
-    const dataBytes = encoder.encode(dataStr);
-
-    const schemaPtr = this.exports.dto_alloc(schemaBytes.length);
-    new Uint8Array(this.memory.buffer, schemaPtr, schemaBytes.length).set(schemaBytes);
-
-    const dataPtr = this.exports.dto_alloc(dataBytes.length);
-    new Uint8Array(this.memory.buffer, dataPtr, dataBytes.length).set(dataBytes);
-
+    const compiled = this.compile(schema);
     try {
-      const resPtr = this.exports.dto_transform(
-        schemaPtr,
-        schemaBytes.length,
-        dataPtr,
-        dataBytes.length
-      );
-
-      const view = new DataView(this.memory.buffer);
-      const payloadLen = view.getUint32(resPtr, true);
-
-      const payloadBytes = new Uint8Array(this.memory.buffer, resPtr + 4, payloadLen);
-      const resultStr = decoder.decode(payloadBytes);
-
-      this.exports.dto_dealloc(resPtr, payloadLen + 4);
-
-      const parsed = JSON.parse(resultStr);
-      if (
-        parsed &&
-        typeof parsed === 'object' &&
-        parsed.error &&
-        Object.keys(parsed).length === 1
-      ) {
-        throw new Error(`DTO transform error: ${parsed.error}`);
-      }
-
-      return parsed;
+      return compiled.transform(data);
     } finally {
-      this.exports.dto_dealloc(schemaPtr, schemaBytes.length);
-      this.exports.dto_dealloc(dataPtr, dataBytes.length);
+      compiled.free();
     }
   }
+
+  /** @internal Transform with a compiled handle; returns the output JSON text. */
+  _transformHandle(handle, data) {
+    return this._withBytes(toJsonBytes(data), (ptr, len) =>
+      this._readStatus(this.exports.dto_engine_transform(handle, ptr, len))
+    );
+  }
+
+  /** Copy bytes into WASM memory for the duration of `fn(ptr, len)`. */
+  _withBytes(bytes, fn) {
+    const ptr = this.exports.dto_alloc(bytes.length);
+    // Create the view after allocating: allocation may grow (and detach) memory.
+    new Uint8Array(this.memory.buffer, ptr, bytes.length).set(bytes);
+    try {
+      return fn(ptr, bytes.length);
+    } finally {
+      this.exports.dto_dealloc(ptr, bytes.length);
+    }
+  }
+
+  /** Read and free a `[u32 len][u8 status][payload]` result buffer. */
+  _readStatus(resPtr) {
+    const view = new DataView(this.memory.buffer);
+    const len = view.getUint32(resPtr, true);
+    const status = view.getUint8(resPtr + 4);
+    const text = decoder.decode(new Uint8Array(this.memory.buffer, resPtr + 5, len));
+    this.exports.dto_dealloc(resPtr, len + 5);
+    if (status !== STATUS_OK) {
+      throw new Error(`DTO transform error: ${text}`);
+    }
+    return text;
+  }
+}
+
+/**
+ * A recipe / schema / pipeline compiled once by `DTOEngine.compile()`.
+ */
+export class CompiledTransform {
+  constructor(engine, handle) {
+    this.engine = engine;
+    this.handle = handle;
+  }
+
+  /**
+   * @param {object | Array | string} data - Input object or array of objects.
+   * @returns {any} Transformed JavaScript object or array.
+   */
+  transform(data) {
+    return JSON.parse(this.transformRaw(data));
+  }
+
+  /**
+   * Like `transform` but returns the output JSON text without parsing it.
+   * @param {object | Array | string} data
+   * @returns {string}
+   */
+  transformRaw(data) {
+    if (this.handle === null) {
+      throw new Error('DTO transform error: this CompiledTransform has been freed');
+    }
+    return this.engine._transformHandle(this.handle, data);
+  }
+
+  /** Releases the compiled engine inside WebAssembly. Safe to call twice. */
+  free() {
+    if (this.handle !== null) {
+      this.engine.exports.dto_engine_free(this.handle);
+      this.handle = null;
+    }
+  }
+}
+
+if (typeof Symbol.dispose === 'symbol') {
+  CompiledTransform.prototype[Symbol.dispose] = CompiledTransform.prototype.free;
 }

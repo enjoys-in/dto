@@ -165,6 +165,123 @@ pub extern "C" fn dto_transform(
     ptr
 }
 
+// ─── Compile-once engine handles (status-byte protocol) ───
+//
+// `dto_transform` re-parses the recipe on every call and reports errors as an
+// `{"error": ...}` payload, which is indistinguishable from a real output that
+// has a single `error` field. The functions below fix both:
+//
+// 1. `dto_engine_new(schema_ptr, schema_len)` compiles a Recipe / JSON Schema /
+//    pipeline once and returns a handle.
+// 2. `dto_engine_transform(handle, data_ptr, data_len)` transforms with it.
+// 3. `dto_engine_free(handle)` releases it (returns 1 if it existed, else 0).
+//
+// Result buffers from (1) and (2):
+// - bytes 0..4: payload length `L` (u32, little-endian)
+// - byte 4:     status — 0 = ok, 1 = error
+// - bytes 5..5+L: UTF-8 payload — the handle in decimal (1), the output JSON
+//   (2), or an error message.
+// Free them with `dto_dealloc(ptr, L + 5)`.
+//
+// Handles are never reused, so a stale handle gives an error instead of
+// silently using another engine. Each WASM instance has its own handles.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+const STATUS_OK: u8 = 0;
+const STATUS_ERR: u8 = 1;
+
+#[derive(Default)]
+struct Registry {
+    last_handle: u32,
+    engines: HashMap<u32, DtoEngine>,
+}
+
+thread_local! {
+    static ENGINES: RefCell<Registry> = RefCell::new(Registry::default());
+}
+
+/// Borrow `len` bytes at `ptr` as UTF-8.
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes (as written by the host after `dto_alloc`).
+unsafe fn read_utf8<'a>(ptr: *const u8, len: usize, what: &str) -> Result<&'a str, String> {
+    if ptr.is_null() {
+        return Err(format!("null {what} pointer"));
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len);
+    std::str::from_utf8(bytes).map_err(|e| format!("{what} is not valid UTF-8: {e}"))
+}
+
+/// Write a status-prefixed result buffer.
+fn status_buffer(result: Result<String, String>) -> *mut u8 {
+    let (status, payload) = match result {
+        Ok(text) => (STATUS_OK, text),
+        Err(message) => (STATUS_ERR, message),
+    };
+    let bytes = payload.as_bytes();
+    let ptr = dto_alloc(5 + bytes.len());
+    unsafe {
+        std::ptr::copy_nonoverlapping((bytes.len() as u32).to_le_bytes().as_ptr(), ptr, 4);
+        *ptr.add(4) = status;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(5), bytes.len());
+    }
+    ptr
+}
+
+fn guarded(f: impl FnOnce() -> Result<String, String>) -> *mut u8 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or_else(|_| Err("dto engine panicked".to_string()));
+    status_buffer(result)
+}
+
+/// Compile a Recipe / JSON Schema / pipeline once; see the protocol notes above.
+#[no_mangle]
+pub extern "C" fn dto_engine_new(schema_ptr: *const u8, schema_len: usize) -> *mut u8 {
+    guarded(|| {
+        let schema = unsafe { read_utf8(schema_ptr, schema_len, "schema")? };
+        let engine = DtoEngine::from_json(schema).map_err(|e| format!("schema error: {e}"))?;
+        ENGINES.with(|cell| {
+            let mut registry = cell.borrow_mut();
+            let handle = registry
+                .last_handle
+                .checked_add(1)
+                .ok_or_else(|| "engine handle space exhausted".to_string())?;
+            registry.last_handle = handle;
+            registry.engines.insert(handle, engine);
+            Ok(handle.to_string())
+        })
+    })
+}
+
+/// Transform data with a compiled engine; see the protocol notes above.
+#[no_mangle]
+pub extern "C" fn dto_engine_transform(handle: u32, data_ptr: *const u8, data_len: usize) -> *mut u8 {
+    guarded(|| {
+        let data = unsafe { read_utf8(data_ptr, data_len, "data")? };
+        let input: serde_json::Value =
+            serde_json::from_str(data).map_err(|e| format!("input JSON parse error: {e}"))?;
+        ENGINES.with(|cell| {
+            let registry = cell.borrow();
+            let engine = registry
+                .engines
+                .get(&handle)
+                .ok_or_else(|| format!("unknown or freed engine handle {handle}"))?;
+            let output = engine
+                .transform(&input)
+                .map_err(|e| format!("transformation error: {e}"))?;
+            serde_json::to_string(&output).map_err(|e| format!("output serialization error: {e}"))
+        })
+    })
+}
+
+/// Release a compiled engine. Returns 1 if the handle existed, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn dto_engine_free(handle: u32) -> u32 {
+    ENGINES.with(|cell| u32::from(cell.borrow_mut().engines.remove(&handle).is_some()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +402,74 @@ mod tests {
 
         let (val, _) = read_and_free_c_abi_result(ptr);
         assert!(val.get("error").is_some());
+    }
+
+    /// Read and free a status-prefixed buffer: (is_ok, payload).
+    fn read_status(ptr: *mut u8) -> (bool, String) {
+        unsafe {
+            let mut len_bytes = [0u8; 4];
+            std::ptr::copy_nonoverlapping(ptr, len_bytes.as_mut_ptr(), 4);
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            let status = *ptr.add(4);
+            let payload = std::str::from_utf8(std::slice::from_raw_parts(ptr.add(5), len))
+                .unwrap()
+                .to_string();
+            dto_dealloc(ptr, len + 5);
+            (status == STATUS_OK, payload)
+        }
+    }
+
+    fn new_engine(schema: &str) -> (bool, String) {
+        read_status(dto_engine_new(schema.as_ptr(), schema.len()))
+    }
+
+    fn run(handle: u32, data: &str) -> (bool, String) {
+        read_status(dto_engine_transform(handle, data.as_ptr(), data.len()))
+    }
+
+    #[test]
+    fn engine_handle_compiles_once_and_transforms_many_times() {
+        let (ok, handle) = new_engine(r#"{"name":"T","mappings":[{"source":"user.name","target":"name"}]}"#);
+        assert!(ok, "{handle}");
+        let handle: u32 = handle.parse().unwrap();
+
+        for name in ["Ada", "Linus"] {
+            let (ok, out) = run(handle, &format!(r#"{{"user":{{"name":"{name}"}}}}"#));
+            assert!(ok);
+            assert_eq!(out, format!(r#"{{"name":"{name}"}}"#));
+        }
+
+        assert_eq!(dto_engine_free(handle), 1);
+        assert_eq!(dto_engine_free(handle), 0);
+        let (ok, err) = run(handle, "{}");
+        assert!(!ok);
+        assert!(err.contains("unknown or freed engine handle"));
+    }
+
+    #[test]
+    fn status_byte_separates_errors_from_outputs_named_error() {
+        // A real output whose only key is "error" must not be mistaken for a failure.
+        let (_, handle) = new_engine(r#"{"name":"T","mappings":[{"source":"msg","target":"error"}]}"#);
+        let handle: u32 = handle.parse().unwrap();
+        assert_eq!(run(handle, r#"{"msg":"disk full"}"#), (true, r#"{"error":"disk full"}"#.to_string()));
+
+        let (ok, err) = run(handle, "not json");
+        assert!(!ok);
+        assert!(err.starts_with("input JSON parse error"));
+        dto_engine_free(handle);
+
+        let (ok, err) = new_engine(r#"{"name":"T","mappings":[{"source":"a","target":"b","cast":"nope"}]}"#);
+        assert!(!ok);
+        assert!(err.contains("nope"));
+    }
+
+    #[test]
+    fn handles_are_not_reused() {
+        let schema = r#"{"name":"T","mappings":[{"source":"a","target":"b"}]}"#;
+        let first: u32 = new_engine(schema).1.parse().unwrap();
+        dto_engine_free(first);
+        let second: u32 = new_engine(schema).1.parse().unwrap();
+        assert_ne!(first, second);
+        dto_engine_free(second);
     }
 }

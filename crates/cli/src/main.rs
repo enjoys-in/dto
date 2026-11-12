@@ -6,7 +6,7 @@
 
 use std::fmt;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
@@ -101,9 +101,19 @@ fn main() {
     }
 }
 
-/// Load the schema, then transform either the whole input at once or — with
-/// `--chunk-size` and a top-level array — stream it chunk by chunk so that only
-/// one chunk of input and output is in memory at a time.
+/// Records per chunk when streaming an array without an explicit `--chunk-size`.
+const DEFAULT_CHUNK: usize = 2000;
+const IO_BUFFER: usize = 1 << 20;
+
+/// Load the schema and transform the input.
+///
+/// - Default, top-level array: the input is read as raw bytes and its records
+///   are parsed, transformed and written [`DEFAULT_CHUNK`] at a time, so memory
+///   stays near the file size instead of ~20x it for a fully parsed document.
+/// - `--chunk-size N`: the input is also *read* incrementally, so memory is
+///   about one chunk regardless of file size (somewhat slower to parse).
+/// - Pipelines and non-array input are transformed whole (pipeline
+///   deduplication needs every record).
 fn run_transform(
     schema: &Path,
     input: Option<&Path>,
@@ -136,29 +146,87 @@ fn run_transform(
     let mut out = io::BufWriter::with_capacity(IO_BUFFER, stdout.lock());
 
     match chunk_size {
-        Some(cs) => transform_streaming(&engine, reader, &mut out, cs, pretty).map(|_| ())?,
-        None => transform_whole(&engine, reader, &mut out, pretty)?,
-    }
+        Some(cs) => transform_streaming(&engine, reader, &mut out, cs, pretty)?,
+        None => transform_buffered(&engine, reader, &mut out, pretty)?,
+    };
     out.flush().map_err(|e| format!("failed to write output: {e}"))
 }
 
-const IO_BUFFER: usize = 1 << 20;
-
-/// Parse the whole input, transform it, and write the result.
-fn transform_whole<R: BufRead, W: Write>(
+/// Read the whole input as bytes. A top-level array (recipe/schema engines) is
+/// then streamed record by record; anything else is transformed whole.
+/// Returns the number of records streamed (0 for whole transforms).
+fn transform_buffered<R: Read, W: Write>(
     engine: &DtoEngine,
     mut reader: R,
     out: &mut W,
     pretty: bool,
-) -> Result<(), String> {
-    let mut text = String::new();
+) -> Result<usize, String> {
+    let mut bytes = Vec::new();
     reader
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("failed to read input: {e}"))?;
-    let input: Value =
-        serde_json::from_str(&text).map_err(|e| format!("input JSON parse error: {e}"))?;
-    drop(text);
 
+    let first = bytes.iter().copied().find(|b| !b.is_ascii_whitespace());
+    if first == Some(b'[') && !engine.is_pipeline() {
+        let mut de = serde_json::Deserializer::from_slice(&bytes);
+        return stream_array(engine, &mut de, out, DEFAULT_CHUNK, pretty);
+    }
+
+    let input: Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("input JSON parse error: {e}"))?;
+    drop(bytes);
+    write_whole(engine, input, out, pretty)?;
+    Ok(0)
+}
+
+/// Read a top-level JSON array incrementally and stream it `chunk_size`
+/// records at a time. Non-array input falls back to [`transform_buffered`].
+///
+/// On error the process exits non-zero and the output written so far is incomplete.
+fn transform_streaming<R: BufRead, W: Write>(
+    engine: &DtoEngine,
+    mut reader: R,
+    out: &mut W,
+    chunk_size: usize,
+    pretty: bool,
+) -> Result<usize, String> {
+    match first_non_whitespace(&mut reader).map_err(|e| format!("failed to read input: {e}"))? {
+        Some(b'[') => {}
+        _ => return transform_buffered(engine, reader, out, pretty),
+    }
+    let mut de = serde_json::Deserializer::from_reader(reader);
+    stream_array(engine, &mut de, out, chunk_size, pretty)
+}
+
+/// Pull array elements from `de` one at a time, transforming and writing
+/// them every `chunk_size` records. Returns the number of records written.
+fn stream_array<'de, R: serde_json::de::Read<'de>, W: Write>(
+    engine: &DtoEngine,
+    de: &mut serde_json::Deserializer<R>,
+    out: &mut W,
+    chunk_size: usize,
+    pretty: bool,
+) -> Result<usize, String> {
+    out.write_all(b"[").map_err(|e| format!("failed to write output: {e}"))?;
+    let visitor = StreamArray {
+        engine,
+        out: &mut *out,
+        chunk_size: chunk_size.max(1),
+        pretty,
+        written: 0,
+    };
+    let written = (&mut *de)
+        .deserialize_seq(visitor)
+        .map_err(|e| format!("transform failed: {e}"))?;
+    de.end().map_err(|e| format!("input JSON parse error: {e}"))?;
+
+    let close: &[u8] = if pretty && written > 0 { b"\n]\n" } else { b"]\n" };
+    out.write_all(close).map_err(|e| format!("failed to write output: {e}"))?;
+    Ok(written)
+}
+
+/// Transform an already-parsed input in one go and write the result.
+fn write_whole<W: Write>(engine: &DtoEngine, input: Value, out: &mut W, pretty: bool) -> Result<(), String> {
     let output = engine.transform(&input).map_err(|e| format!("transform failed: {e}"))?;
     drop(input);
 
@@ -171,41 +239,6 @@ fn transform_whole<R: BufRead, W: Write>(
         .map_err(io::Error::from)
         .and_then(|_| out.write_all(b"\n"))
         .map_err(|e| format!("failed to write output: {e}"))
-}
-
-/// Stream a top-level JSON array `chunk_size` records at a time. Non-array input
-/// falls back to [`transform_whole`]. Returns the number of records written.
-///
-/// On error the process exits non-zero and the output written so far is incomplete.
-fn transform_streaming<R: BufRead, W: Write>(
-    engine: &DtoEngine,
-    mut reader: R,
-    out: &mut W,
-    chunk_size: usize,
-    pretty: bool,
-) -> Result<usize, String> {
-    match first_non_whitespace(&mut reader).map_err(|e| format!("failed to read input: {e}"))? {
-        Some(b'[') => {}
-        _ => return transform_whole(engine, reader, out, pretty).map(|_| 0),
-    }
-
-    out.write_all(b"[").map_err(|e| format!("failed to write output: {e}"))?;
-    let mut de = serde_json::Deserializer::from_reader(reader);
-    let visitor = StreamArray {
-        engine,
-        out: &mut *out,
-        chunk_size: chunk_size.max(1),
-        pretty,
-        written: 0,
-    };
-    let written = (&mut de)
-        .deserialize_seq(visitor)
-        .map_err(|e| format!("transform failed: {e}"))?;
-    de.end().map_err(|e| format!("input JSON parse error: {e}"))?;
-
-    let close: &[u8] = if pretty && written > 0 { b"\n]\n" } else { b"]\n" };
-    out.write_all(close).map_err(|e| format!("failed to write output: {e}"))?;
-    Ok(written)
 }
 
 /// Skip leading whitespace and peek at the first significant byte.
@@ -965,11 +998,20 @@ mod tests {
         Ok((n, String::from_utf8(out).unwrap()))
     }
 
+    /// Reference output: parse everything, transform in one call.
     fn whole(input: &str, pretty: bool) -> String {
         let engine = DtoEngine::from_json(RECIPE).unwrap();
         let mut out = Vec::new();
-        transform_whole(&engine, io::Cursor::new(input.as_bytes()), &mut out, pretty).unwrap();
+        write_whole(&engine, serde_json::from_str(input).unwrap(), &mut out, pretty).unwrap();
         String::from_utf8(out).unwrap()
+    }
+
+    /// Default CLI mode: buffered bytes, streamed records.
+    fn buffered(input: &str, pretty: bool) -> Result<(usize, String), String> {
+        let engine = DtoEngine::from_json(RECIPE).unwrap();
+        let mut out = Vec::new();
+        let n = transform_buffered(&engine, io::Cursor::new(input.as_bytes()), &mut out, pretty)?;
+        Ok((n, String::from_utf8(out).unwrap()))
     }
 
     #[test]
@@ -978,15 +1020,35 @@ mod tests {
             &(0..25).map(|i| json!({"id": i, "name": format!(" n{i} ")})).collect::<Vec<_>>(),
         )
         .unwrap();
-        for chunk in [1, 4, 25, 100] {
-            for pretty in [false, true] {
+        for pretty in [false, true] {
+            let expected = whole(&input, pretty);
+            for chunk in [1, 4, 25, 100] {
                 let (n, streamed) = stream(&format!("  \n{input}\n"), chunk, pretty).unwrap();
                 assert_eq!(n, 25);
-                let a: Value = serde_json::from_str(&streamed).unwrap();
-                let b: Value = serde_json::from_str(&whole(&input, pretty)).unwrap();
-                assert_eq!(a, b, "chunk={chunk} pretty={pretty}");
+                assert_eq!(streamed, expected, "chunk={chunk} pretty={pretty}");
             }
+            let (n, default_mode) = buffered(&format!("\n{input}"), pretty).unwrap();
+            assert_eq!(n, 25);
+            assert_eq!(default_mode, expected, "default mode, pretty={pretty}");
         }
+    }
+
+    #[test]
+    fn default_mode_reports_position_and_handles_objects_and_pipelines() {
+        let err = buffered(r#"[{"id":1},{"nope":2}]"#, false).unwrap_err();
+        assert!(err.contains("item 1: required field 'id'"), "got {err}");
+        assert_eq!(buffered(r#"{"id":7,"name":"x"}"#, false).unwrap().1, "{\"id\":7,\"name\":\"X\"}\n");
+
+        // Pipelines are transformed whole (dedup across all records).
+        let engine = DtoEngine::from_json(
+            r#"{"targets":[{"table":"t","business_key":["k"],"dedup_strategy":"latest",
+                "mappings":[{"source":"k","target":"k"},{"source":"v","target":"v"}]}]}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        transform_buffered(&engine, io::Cursor::new(&br#"[{"k":1,"v":1},{"k":1,"v":2}]"#[..]), &mut out, false)
+            .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "{\"t\":[{\"k\":1,\"v\":2}]}\n");
     }
 
     #[test]

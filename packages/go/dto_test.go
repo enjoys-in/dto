@@ -3,6 +3,10 @@ package dto
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -150,5 +154,99 @@ func TestMedallionPipelineMultiTable(t *testing.T) {
 	}
 	if res["silver_orders"][0]["part_number"] != "PART-100" {
 		t.Errorf("expected broadcasted parent part_number 'PART-100', got %v", res["silver_orders"][0]["part_number"])
+	}
+}
+
+func TestCompileOnceTransformMany(t *testing.T) {
+	ctx := context.Background()
+	engine, err := New(ctx)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer engine.Close(ctx)
+
+	compiled, err := engine.Compile([]byte(`{"name":"T","mappings":[{"source":"user.name","target":"name"}]}`))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	for _, name := range []string{"Ada", "Linus"} {
+		out, err := compiled.Transform([]byte(`{"user":{"name":"` + name + `"}}`))
+		if err != nil {
+			t.Fatalf("Transform: %v", err)
+		}
+		if string(out) != `{"name":"`+name+`"}` {
+			t.Fatalf("unexpected output %s", out)
+		}
+	}
+	if err := compiled.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := compiled.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if _, err := compiled.Transform([]byte(`{}`)); !errors.Is(err, ErrClosed) {
+		t.Fatalf("expected ErrClosed, got %v", err)
+	}
+}
+
+func TestErrorsAndOutputsNamedError(t *testing.T) {
+	ctx := context.Background()
+	engine, err := New(ctx)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer engine.Close(ctx)
+
+	// A real output with a single "error" field used to be mistaken for a failure.
+	out, err := engine.Transform([]byte(`{"name":"T","mappings":[{"source":"msg","target":"error"}]}`), []byte(`{"msg":"disk full"}`))
+	if err != nil || string(out) != `{"error":"disk full"}` {
+		t.Fatalf("got %s, %v", out, err)
+	}
+
+	_, err = engine.Transform([]byte(`{"name":"T","mappings":[{"source":"id","target":"id"}],"required":["id"]}`), []byte(`[{"id":1},{}]`))
+	if err == nil || !strings.Contains(err.Error(), "item 1: required field 'id'") {
+		t.Fatalf("expected item 1 error, got %v", err)
+	}
+
+	if _, err := engine.Compile([]byte(`{"name":"T","mappings":[{"source":"a","target":"b","cast":"nope"}]}`)); err == nil || !strings.Contains(err.Error(), "nope") {
+		t.Fatalf("expected compile error, got %v", err)
+	}
+}
+
+func TestConcurrentTransformsUseSeparateInstances(t *testing.T) {
+	ctx := context.Background()
+	engine, err := New(ctx)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer engine.Close(ctx)
+
+	compiled, err := engine.Compile([]byte(`{"name":"T","mappings":[{"source":"n","target":"n"}]}`))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	defer compiled.Close()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 64)
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			want := fmt.Sprintf(`{"n":%d}`, i)
+			out, err := engine.Transform([]byte(`{"name":"T","mappings":[{"source":"n","target":"n"}]}`), []byte(want))
+			if err != nil || string(out) != want {
+				errs <- fmt.Errorf("Transform %d: %s, %v", i, out, err)
+			}
+			out, err = compiled.Transform([]byte(want))
+			if err != nil || string(out) != want {
+				errs <- fmt.Errorf("Compiled %d: %s, %v", i, out, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }

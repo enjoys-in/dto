@@ -6,7 +6,8 @@
       "filters": {
         "source_system": "api_ingest",
         "source_entity": "part"
-      }
+      },
+      "filter_action": "keep"
     }
   ],
   "targets": [
@@ -103,16 +104,7 @@
           "source": "reference.tax",
           "target": "flex_num_2"
         }
-      ],
-      "contract": {
-        "types": {},
-        "nullable": [],
-        "required": [
-          "item_id"
-        ],
-        "constraints": [],
-        "drift_watch": []
-      }
+      ]
     },
     {
       "table": "silver_purchase_order",
@@ -256,16 +248,7 @@
           "target": "flex_ts_1",
           "unpack": "array_explode"
         }
-      ],
-      "contract": {
-        "types": {},
-        "nullable": [],
-        "required": [
-          "item_id"
-        ],
-        "constraints": [],
-        "drift_watch": []
-      }
+      ]
     },
     {
       "table": "silver_purchase_order_line",
@@ -459,16 +442,7 @@
           "target": "flex_bool_2",
           "unpack": "array_explode"
         }
-      ],
-      "contract": {
-        "types": {},
-        "nullable": [],
-        "required": [
-          "item_id"
-        ],
-        "constraints": [],
-        "drift_watch": []
-      }
+      ]
     },
     {
       "table": "silver_supplier",
@@ -500,16 +474,7 @@
           "target": "headquarters_city",
           "unpack": "array_explode"
         }
-      ],
-      "contract": {
-        "types": {},
-        "nullable": [],
-        "required": [
-          "item_id"
-        ],
-        "constraints": [],
-        "drift_watch": []
-      }
+      ]
     },
     {
       "table": "silver_company_site",
@@ -548,16 +513,7 @@
           "target": "company_level_0",
           "unpack": "array_explode"
         }
-      ],
-      "contract": {
-        "types": {},
-        "nullable": [],
-        "required": [
-          "item_id"
-        ],
-        "constraints": [],
-        "drift_watch": []
-      }
+      ]
     },
     {
       "table": "silver_supplier_location",
@@ -596,16 +552,7 @@
           "target": "state_province",
           "unpack": "array_explode"
         }
-      ],
-      "contract": {
-        "types": {},
-        "nullable": [],
-        "required": [
-          "item_id"
-        ],
-        "constraints": [],
-        "drift_watch": []
-      }
+      ]
     }
   ],
   "table_first": false

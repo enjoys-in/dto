@@ -14,11 +14,22 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 
 /**
- * High-performance DTO data transformation engine for Java powered by WebAssembly.
- * Uses Chicory for pure Java, zero-dependency execution without any CGO/JNI native binaries.
+ * DTO data transformation engine for Java powered by WebAssembly.
+ * Uses Chicory for pure Java execution without any JNI native binaries.
+ *
+ * <p>Use {@link #compile(String)} once and call {@link CompiledTransform#transform(String)}
+ * many times to avoid re-parsing the recipe on every call. {@link #transform(String, String)}
+ * is a one-shot convenience. All methods are synchronized on the engine.
  */
 public class DTOEngine implements AutoCloseable {
-    private final WasmModule module;
+    private static final int STATUS_OK = 0;
+
+    private final Memory memory;
+    private final ExportFunction alloc;
+    private final ExportFunction dealloc;
+    private final ExportFunction engineNew;
+    private final ExportFunction engineTransform;
+    private final ExportFunction engineFree;
 
     /**
      * Creates a new DTOEngine using the bundled dto.wasm binary.
@@ -31,7 +42,15 @@ public class DTOEngine implements AutoCloseable {
      * Creates a new DTOEngine from custom WebAssembly bytes.
      */
     public DTOEngine(byte[] wasmBytes) {
-        this.module = Parser.parse(wasmBytes);
+        WasmModule module = Parser.parse(wasmBytes);
+        // One instance for the engine's lifetime: compiled handles live in its memory.
+        Instance instance = Instance.builder(module).build();
+        this.memory = instance.memory();
+        this.alloc = instance.export("dto_alloc");
+        this.dealloc = instance.export("dto_dealloc");
+        this.engineNew = instance.export("dto_engine_new");
+        this.engineTransform = instance.export("dto_engine_transform");
+        this.engineFree = instance.export("dto_engine_free");
     }
 
     private static byte[] loadDefaultWasm() {
@@ -52,52 +71,75 @@ public class DTOEngine implements AutoCloseable {
     }
 
     /**
-     * Transforms input JSON data according to the given Recipe or JSON Schema.
+     * Compiles a Recipe, JSON Schema or pipeline once.
+     *
+     * @param schemaJson Recipe / JSON Schema / pipeline (UTF-8 JSON string).
+     * @return a compiled transform; close it when done.
+     * @throws DTOException on configuration errors (unknown functions, bad paths, ...).
+     */
+    public synchronized CompiledTransform compile(String schemaJson) {
+        byte[] bytes = schemaJson.getBytes(StandardCharsets.UTF_8);
+        int ptr = write(bytes);
+        try {
+            int resPtr = (int) engineNew.apply(ptr, bytes.length)[0];
+            long handle = Long.parseLong(readStatus(resPtr));
+            return new CompiledTransform(this, handle);
+        } finally {
+            dealloc.apply(ptr, bytes.length);
+        }
+    }
+
+    /**
+     * Transforms input JSON data according to the given Recipe or JSON Schema (one-shot).
      *
      * @param schemaJson Recipe or JSON Schema (UTF-8 JSON string).
      * @param dataJson   Input object or array of objects (UTF-8 JSON string).
      * @return Transformed JSON string.
+     * @throws DTOException if the schema is invalid or any record fails.
      */
     public synchronized String transform(String schemaJson, String dataJson) {
-        Instance instance = Instance.builder(module).build();
-        Memory memory = instance.memory();
-
-        ExportFunction alloc = instance.export("dto_alloc");
-        ExportFunction dealloc = instance.export("dto_dealloc");
-        ExportFunction transform = instance.export("dto_transform");
-
-        byte[] schemaBytes = schemaJson.getBytes(StandardCharsets.UTF_8);
-        byte[] dataBytes = dataJson.getBytes(StandardCharsets.UTF_8);
-
-        int schemaPtr = (int) alloc.apply(schemaBytes.length)[0];
-        memory.write(schemaPtr, schemaBytes);
-
-        int dataPtr = (int) alloc.apply(dataBytes.length)[0];
-        memory.write(dataPtr, dataBytes);
-
-        try {
-            int resPtr = (int) transform.apply(schemaPtr, schemaBytes.length, dataPtr, dataBytes.length)[0];
-
-            // Read 4-byte little-endian length prefix
-            byte[] lenBytes = memory.readBytes(resPtr, 4);
-            int payloadLen = ByteBuffer.wrap(lenBytes).order(ByteOrder.LITTLE_ENDIAN).getInt();
-
-            // Read payload
-            byte[] payloadBytes = memory.readBytes(resPtr + 4, payloadLen);
-            String resultStr = new String(payloadBytes, StandardCharsets.UTF_8);
-
-            // Free result memory in WASM
-            dealloc.apply(resPtr, payloadLen + 4);
-
-            return resultStr;
-        } finally {
-            dealloc.apply(schemaPtr, schemaBytes.length);
-            dealloc.apply(dataPtr, dataBytes.length);
+        try (CompiledTransform compiled = compile(schemaJson)) {
+            return compiled.transform(dataJson);
         }
+    }
+
+    synchronized String transformWithHandle(long handle, String dataJson) {
+        byte[] bytes = dataJson.getBytes(StandardCharsets.UTF_8);
+        int ptr = write(bytes);
+        try {
+            int resPtr = (int) engineTransform.apply(handle, ptr, bytes.length)[0];
+            return readStatus(resPtr);
+        } finally {
+            dealloc.apply(ptr, bytes.length);
+        }
+    }
+
+    synchronized void freeHandle(long handle) {
+        engineFree.apply(handle);
+    }
+
+    /** Copies bytes into WASM memory; the caller must dealloc. */
+    private int write(byte[] bytes) {
+        int ptr = (int) alloc.apply(bytes.length)[0];
+        memory.write(ptr, bytes);
+        return ptr;
+    }
+
+    /** Reads and frees a [u32 len][u8 status][payload] result buffer. */
+    private String readStatus(int resPtr) {
+        byte[] header = memory.readBytes(resPtr, 5);
+        int len = ByteBuffer.wrap(header, 0, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+        int status = header[4];
+        String text = new String(memory.readBytes(resPtr + 5, len), StandardCharsets.UTF_8);
+        dealloc.apply(resPtr, len + 5);
+        if (status != STATUS_OK) {
+            throw new DTOException(text);
+        }
+        return text;
     }
 
     @Override
     public void close() {
-        // Resources cleanup
+        // The WASM instance is garbage-collected with the engine.
     }
 }

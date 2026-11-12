@@ -1,4 +1,6 @@
 {
+  "source_system": "api_ingest",
+  "source_entity": "part",
   "item_id": "PART-889900",
   "revision_number": "R3",
   "reference": {

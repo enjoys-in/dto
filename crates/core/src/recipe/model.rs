@@ -87,7 +87,7 @@ pub struct FieldMapping {
 }
 
 /// Validation constraint for an output field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Constraint {
     /// Expected type: "string", "number", "boolean", "array", "object", "null"
     #[serde(rename = "type")]
@@ -110,7 +110,11 @@ pub struct Constraint {
     #[serde(default)]
     pub max_length: Option<usize>,
 
-    /// Regex pattern for string validation.
+    /// Regex pattern for string values. Like JSON Schema it is unanchored (it may
+    /// match anywhere), so use `^...$` to match the whole value. Non-string values
+    /// are not checked (use `type: "string"` to require a string). Syntax is
+    /// `regex-lite`: `\d`, `\w`, `\s` are ASCII-only and Unicode classes such as
+    /// `\p{L}` are not supported.
     #[serde(default)]
     pub pattern: Option<String>,
 
@@ -121,6 +125,10 @@ pub struct Constraint {
     /// Custom error message when constraint is violated.
     #[serde(default)]
     pub message: Option<String>,
+
+    /// `pattern` compiled on first use, shared across threads.
+    #[serde(skip)]
+    pub(crate) compiled_pattern: std::sync::OnceLock<Option<regex_lite::Regex>>,
 }
 
 /// Constraint `type` values understood by the validator.
@@ -138,10 +146,10 @@ impl Constraint {
                 ));
             }
         }
-        if self.pattern.is_some() {
-            return Err(format!(
-                "constraint on '{field}': 'pattern' is not supported yet (it was previously ignored)"
-            ));
+        if let Some(ref pattern) = self.pattern {
+            if let Err(e) = regex_lite::Regex::new(pattern) {
+                return Err(format!("constraint on '{field}': invalid pattern '{pattern}': {e}"));
+            }
         }
         if let (Some(min), Some(max)) = (self.min, self.max) {
             if min > max {

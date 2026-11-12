@@ -74,7 +74,8 @@ Recipes define clean `source` $\rightarrow$ `target` field mappings:
 > **Note on Naming**: `target` is the primary field name (with `to` supported as a backwards-compatible alias). `cast` is the primary type converter (with `transform` supported as an alias).
 
 ### Supported Path Expressions
-- **Field access**: `user.profile.name`
+- **Field access**: `user.profile.name`. Unquoted names may contain letters, digits, `_` and `-` (`headers.content-type`)
+- **Quoted keys** for any other characters: `user["first name"]`, `meta['@type']`, `data["a.b"]` (`\` escapes a quote)
 - **Array indexing**: `orders[0].id`, `items[-1].sku` (negative index counts from end)
 - **Wildcard projections**: `roles[*].name`, `tags[*]` (extracts array)
 - **Literal values**: `"literal": true` treats `source` as a constant string
@@ -117,7 +118,8 @@ You can chain multiple transformations using either **pipe (`|`)**, **comma (`,`
 ### Error Handling
 - **Configuration errors fail when the engine is created**: unknown functions, invalid paths, `required` fields with no mapping, duplicate targets, unknown constraint types, unknown pipeline `grain` / `dedup_strategy` / `unpack` values.
 - **Array input fails as a whole** if any record fails (missing required field, failed cast, constraint violation, non-object element). The error names the record's position in the input, e.g. `item 1: required field 'id' is missing`. To keep the good records and collect the bad ones, use `DtoEngine::transform_batch` (Rust). Its `BatchResult` has `items`, their original `indices`, `errors` and `validation_errors`.
-- **Constraints**: `type` (`string`, `number`, `integer`, `boolean`, `array`, `object`, `null`), `min`/`max`, `min_length`/`max_length` (counted in characters), `allowed`, and an optional `message` that replaces the default error text. `pattern` is not supported yet and is rejected rather than ignored.
+- **Constraints**: `type` (`string`, `number`, `integer`, `boolean`, `array`, `object`, `null`), `min`/`max`, `min_length`/`max_length` (counted in characters), `allowed`, `pattern`, and an optional `message` that replaces the default error text.
+  - `pattern` is a regular expression for string values. Like JSON Schema it can match anywhere in the value, so use `^...$` to match the whole value, e.g. `"pattern": "^PO-\\d{3}$"`. It uses the `regex-lite` syntax: `\d`, `\w` and `\s` match ASCII only, and Unicode classes such as `\p{L}` are not available. An invalid pattern is reported when the recipe loads.
 
 ---
 
@@ -166,8 +168,25 @@ For enterprise data ingestion, the engine natively executes multi-target relatio
 3. **Deduplication (`dedup_strategy: "latest"`)**: Groups rows by their `business_key` and keeps one row per key. Set `sequence_by` (alias `order_by`) to an output column to keep the row with the greatest value. Numbers compare numerically and strings lexicographically, so ISO-8601 timestamps sort correctly when they share one offset; ties go to the later row. Without `sequence_by`, the **last row in input order** wins. Rows whose key column is missing or null are never merged. `business_key` and `sequence_by` must name columns that a mapping produces.
 4. **Grain**: `grain: "header"` produces one row per document, even when a mapping such as `roles[*].name` yields an array column. `grain: "line"`, or any `unpack: "array_explode"` mapping, produces one row per element of the exploded array. Inline pipes (`transactions[*].qty | to_number`) work on exploded fields.
 5. **Column Categorization**: Supports `kind: "column"` and `kind: "extension"`.
+6. **Source filters**: a source's `filters` work like an `if` condition on each input record, and `filter_action` decides what to do with records that match:
 
-> Not implemented yet: `sources[].filters`, `targets[].source_id` and `targets[].contract` are accepted, but nothing is enforced.
+   ```json
+   "sources": [{
+     "id": "item",
+     "filters": { "source_system": "api_ingest", "meta.entity": "part" },
+     "filter_action": "keep"
+   }]
+   ```
+
+   | `filter_action` | Effect |
+   |---|---|
+   | `"keep"` (default) | Only matching records are processed; the rest are skipped |
+   | `"delete"` | Matching records are skipped; the rest are processed |
+   | `"ignore"` | The filter is switched off; every record is processed |
+
+   A record matches when **every** `path: value` pair is equal. Paths use the same dot notation as mappings, numbers compare by value (`1` equals `1.0`), and a `null` value also matches a missing field. A target uses the source named by its `source_id`. If the pipeline has exactly one source, targets without `source_id` use it automatically. With several sources, each target must set `source_id`.
+
+Targets accept only the keys documented here. Unknown keys, including the removed `contract` block, are rejected with an error instead of being silently ignored.
 
 ---
 
@@ -209,6 +228,14 @@ func main() {
     }
     fmt.Println(string(out))
     // {"city":"Berlin","name":"Gopher"}
+
+    // Compile once, transform many times (the recipe is parsed only once).
+    compiled, err := engine.Compile(recipe)
+    if err != nil {
+        panic(err)
+    }
+    defer compiled.Close()
+    out, err = compiled.Transform([]byte(`{"profile": {"name": "Ferris", "city": "Oslo"}}`))
 }
 ```
 
@@ -238,6 +265,11 @@ data = {
 result = engine.transform(recipe, data)
 print(result)
 # {'name': 'Guido', 'tags': ['PYTHON', 'WASM']}
+
+# Compile once, transform many times (the recipe is parsed only once).
+with engine.compile(recipe) as compiled:
+    for record in records:
+        print(compiled.transform(record))
 ```
 
 ### JavaScript / TypeScript (`packages/js`)
@@ -263,12 +295,21 @@ const data = {
 const result = engine.transform(recipe, data);
 console.log(result);
 // { name: 'Alice', city: 'Tokyo' }
+
+// Compile once, transform many times (the recipe is parsed only once).
+const compiled = engine.compile(recipe);
+try {
+  for (const record of records) console.log(compiled.transform(record));
+} finally {
+  compiled.free();
+}
 ```
 
 ### Java (`packages/java`)
 Zero native dependencies (no JNI DLLs) via [Chicory](https://github.com/dylibso/chicory):
 
 ```java
+import com.dto.CompiledTransform;
 import com.dto.DTOEngine;
 
 public class Main {
@@ -280,10 +321,20 @@ public class Main {
             String result = engine.transform(recipe, data);
             System.out.println(result);
             // {"name":"Duke"}
+
+            // Compile once, transform many times (the recipe is parsed only once).
+            try (CompiledTransform compiled = engine.compile(recipe)) {
+                System.out.println(compiled.transform("{\"user\":{\"name\":\"Ada\"}}"));
+            }
         }
     }
 }
 ```
+
+### Errors and performance in the SDKs
+- Every SDK reports failures as an error: Go returns an `error`, Python raises `RuntimeError`, JS throws `Error`, and Java throws `DTOException`. The message includes the failing record's position, e.g. `item 1: required field 'id' is missing`. A successful output that happens to contain only an `error` field is returned normally.
+- Each call copies JSON text into WebAssembly and back, and the WASM build runs on a single thread. On one 100k-record batch the JS SDK reaches ~117k records/s with `compile()` (~84k without). For many small calls, `compile()` makes a large difference: ~97k vs ~26k records/s for 20k one-record calls. A hand-written JS mapping is faster still, so the SDKs' value is identical behaviour across languages, not raw speed. For maximum throughput, use the Rust crate or the CLI.
+- Concurrency: Go `Engine.Transform` is safe across goroutines; a Go `Compiled` serializes its calls. The Java engine is synchronized. Python and JS engines are single-threaded.
 
 ---
 
@@ -296,9 +347,14 @@ cargo run --bin dto -- transform -s recipe.json -i data.json --pretty
 # Or pipe through stdin
 cat data.json | cargo run --bin dto -- transform -s recipe.json
 
-# Stream a large top-level array with bounded memory (~23 MB peak for a 95 MB / 300k-record file).
-# The input is parsed incrementally; only one chunk of records is held at a time.
-# Not available for pipelines (deduplication needs the whole input).
+# Arrays are streamed automatically: records are parsed, transformed and written
+# 2,000 at a time, so memory stays near the file size
+# (95 MB / 300k-record file: ~3.0 s, ~112 MB peak, versus ~1.9 GB when fully parsed).
+
+# --chunk-size also reads the file incrementally, so memory stays around one chunk
+# regardless of file size (same file: ~3.5 s, ~23 MB peak).
+# Pipelines are always processed whole because deduplication needs every record,
+# so --chunk-size is rejected for them.
 cargo run --release --bin dto -- transform -s recipe.json -i big.json --chunk-size 2000
 
 # Validate syntax and structure of a recipe/schema
@@ -314,7 +370,7 @@ cargo run --bin dto -- functions
 
 Benchmarked on **Windows (12 Logical CPU Cores, 12 Rayon Worker Threads)** using high-resolution hardware timers, `GetProcessMemoryInfo` for Working Set (RSS) RAM tracking, and `GetProcessTimes` for multi-core CPU utilization.
 
-> **What these numbers measure:** `dto bench` times only the in-memory transform step. The input is already a parsed `serde_json::Value` and the output is not serialized. End-to-end runs that read, parse and write JSON are slower. On the same 12-thread machine, `dto transform` on a 95 MB / 300k-record file took ~2.9 s (~100k records/s), or ~4.2 s with `--chunk-size 2000`. The SDKs run the single-threaded WASM build and copy JSON text across the boundary on every call.
+> **What these numbers measure:** `dto bench` times only the in-memory transform step. The input is already a parsed `serde_json::Value` and the output is not serialized. End-to-end runs that read, parse and write JSON are slower. On the same 12-thread machine, `dto transform` on a 95 MB / 300k-record file takes ~3.0 s (~100k records/s, ~112 MB peak), or ~3.5 s with `--chunk-size 2000` (~23 MB peak). The SDKs run the single-threaded WASM build and copy JSON text across the boundary on every call (see "Errors and performance in the SDKs").
 >
 > The tables below were recorded before paths and transform chains were compiled once per batch. With that change, the same `dto bench` runs measure ~1.49M records/s for the default recipe on 12 threads (~273k on 1 thread) and ~413k records/s for the 6.4 KB enterprise records with `--chunk-size 2000`.
 

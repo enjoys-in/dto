@@ -99,3 +99,28 @@ test('JS/TS DTOEngine Medallion Pipeline multi-table transformation', async () =
   assert.equal(result.silver_orders[0].quantity, 10);
   assert.equal(result.silver_orders[1].quantity, 25);
 });
+
+test('JS/TS compile once, transform many, free', async () => {
+  const engine = await DTOEngine.init();
+  const compiled = engine.compile({ name: 'T', mappings: [{ source: 'user.name', target: 'name' }] });
+  assert.deepEqual(compiled.transform({ user: { name: 'Ada' } }), { name: 'Ada' });
+  assert.deepEqual(compiled.transform([{ user: { name: 'A' } }, { user: { name: 'B' } }]), [{ name: 'A' }, { name: 'B' }]);
+  assert.equal(compiled.transformRaw('{"user":{"name":"Z"}}'), '{"name":"Z"}');
+  compiled.free();
+  compiled.free();
+  assert.throws(() => compiled.transform({}), /has been freed/);
+});
+
+test('JS/TS errors are thrown and outputs named "error" are not', async () => {
+  const engine = await DTOEngine.init();
+  // A real output with a single "error" field used to be mistaken for a failure.
+  assert.deepEqual(
+    engine.transform({ name: 'T', mappings: [{ source: 'msg', target: 'error' }] }, { msg: 'disk full' }),
+    { error: 'disk full' }
+  );
+  assert.throws(
+    () => engine.transform({ name: 'T', mappings: [{ source: 'id', target: 'id' }], required: ['id'] }, [{ id: 1 }, {}]),
+    /item 1: required field 'id'/
+  );
+  assert.throws(() => engine.compile({ name: 'T', mappings: [{ source: 'a', target: 'b', cast: 'nope' }] }), /nope/);
+});

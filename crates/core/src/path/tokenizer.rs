@@ -11,6 +11,12 @@
 //! | `items[-1].sku`      | `[Field("items"), Index(-1), Field("sku")]`            |
 //! | `items[*].name`      | `[Field("items"), Wildcard, Field("name")]`            |
 //! | `name`               | `[Field("name")]`                                      |
+//! | `headers.content-type` | `[Field("headers"), Field("content-type")]`          |
+//! | `user["first name"]` | `[Field("user"), Field("first name")]`                 |
+//! | `meta['@type']`      | `[Field("meta"), Field("@type")]`                      |
+//!
+//! Unquoted field names may contain letters, digits, `_` and `-`. Any other key
+//! can be quoted with `"` or `'` inside brackets; `\` escapes a quote or backslash.
 //!
 //! # Errors
 //!
@@ -45,6 +51,16 @@ pub enum PathError {
     /// Two consecutive dots or a trailing dot produced an empty segment.
     #[error("empty segment (double dot) at position {0}")]
     EmptySegment(usize),
+
+    /// A quoted key (`["..."]`) was not closed.
+    #[error("unclosed quoted key starting at position {0}")]
+    UnclosedQuote(usize),
+}
+
+/// Characters allowed in an unquoted field name: letters, digits, `_` and `-`.
+/// Any other key (spaces, dots, `@`, `$`, …) can be written as `["key"]`.
+pub fn is_bare_key_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
 }
 
 /// Parses a dot-notation path expression into a [`DtoPath`].
@@ -98,6 +114,41 @@ pub fn parse(input: &str) -> Result<DtoPath, PathError> {
                 }
                 expecting_field = true;
             }
+            // Quoted key: ["content-type"] or ['first name'] (any characters).
+            '[' if matches!(chars.get(pos + 1), Some('"') | Some('\'')) => {
+                expecting_field = false;
+                let bracket_start = pos;
+                let quote = chars[pos + 1];
+                pos += 2; // skip `[` and the opening quote
+
+                let mut key = String::new();
+                loop {
+                    match chars.get(pos) {
+                        None => return Err(PathError::UnclosedQuote(bracket_start)),
+                        Some('\\') => {
+                            // `\"`, `\'` and `\\` escape the next character.
+                            match chars.get(pos + 1) {
+                                Some(&c) => key.push(c),
+                                None => return Err(PathError::UnclosedQuote(bracket_start)),
+                            }
+                            pos += 2;
+                        }
+                        Some(&c) if c == quote => {
+                            pos += 1;
+                            break;
+                        }
+                        Some(&c) => {
+                            key.push(c);
+                            pos += 1;
+                        }
+                    }
+                }
+                if chars.get(pos) != Some(&']') {
+                    return Err(PathError::UnclosedBracket(bracket_start));
+                }
+                pos += 1; // skip ']'
+                segments.push(Segment::Field(key));
+            }
             // Bracket: index or wildcard.
             '[' => {
                 expecting_field = false;
@@ -130,11 +181,11 @@ pub fn parse(input: &str) -> Result<DtoPath, PathError> {
                     }
                 }
             }
-            // Start of a field name.
-            c if c.is_alphanumeric() || c == '_' => {
+            // Start of a bare field name.
+            c if is_bare_key_char(c) => {
                 expecting_field = false;
                 let start = pos;
-                while pos < len && (chars[pos].is_alphanumeric() || chars[pos] == '_') {
+                while pos < len && is_bare_key_char(chars[pos]) {
                     pos += 1;
                 }
                 let field: String = chars[start..pos].iter().collect();
@@ -375,5 +426,41 @@ mod tests {
         let input = "items[-1].value";
         let path = parse(input).unwrap();
         assert_eq!(path.to_string(), input);
+    }
+
+    #[test]
+    fn hyphenated_bare_keys() {
+        let path = parse("headers.content-type").unwrap();
+        assert_eq!(
+            path.segments,
+            vec![Segment::Field("headers".into()), Segment::Field("content-type".into())]
+        );
+        assert_eq!(path.to_string(), "headers.content-type");
+    }
+
+    #[test]
+    fn quoted_keys_allow_any_characters() {
+        let path = parse(r#"user["first name"].tags['@type'][0]["a.b|c"]"#).unwrap();
+        assert_eq!(
+            path.segments,
+            vec![
+                Segment::Field("user".into()),
+                Segment::Field("first name".into()),
+                Segment::Field("tags".into()),
+                Segment::Field("@type".into()),
+                Segment::Index(0),
+                Segment::Field("a.b|c".into()),
+            ]
+        );
+        // Display round-trips through the parser.
+        assert_eq!(parse(&path.to_string()).unwrap(), path);
+    }
+
+    #[test]
+    fn quoted_key_escapes_and_errors() {
+        let path = parse(r#"["say \"hi\""]"#).unwrap();
+        assert_eq!(path.segments, vec![Segment::Field(r#"say "hi""#.into())]);
+        assert!(matches!(parse(r#"a["oops"#), Err(PathError::UnclosedQuote(1))));
+        assert!(matches!(parse(r#"a["x"y]"#), Err(PathError::UnclosedBracket(1))));
     }
 }

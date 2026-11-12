@@ -45,6 +45,9 @@ pub enum ValidationError {
     #[error("field '{field}': value not in allowed set")]
     NotAllowed { field: String },
 
+    #[error("field '{field}': value does not match pattern '{pattern}'")]
+    PatternMismatch { field: String, pattern: String },
+
     #[error("{0}")]
     Custom(String),
 }
@@ -127,6 +130,20 @@ fn check_field(
                     max_length: max_len,
                 });
             }
+        }
+    }
+
+    // Regex pattern (strings only, unanchored like JSON Schema)
+    if let (Some(pattern), Value::String(s)) = (&constraint.pattern, value) {
+        let regex = constraint
+            .compiled_pattern
+            .get_or_init(|| regex_lite::Regex::new(pattern).ok());
+        let matched = regex.as_ref().is_some_and(|re| re.is_match(s));
+        if !matched {
+            return Err(ValidationError::PatternMismatch {
+                field: field_name.to_string(),
+                pattern: pattern.clone(),
+            });
         }
     }
 
@@ -223,6 +240,7 @@ mod tests {
             pattern: None,
             allowed: None,
             message: None,
+            ..Default::default()
         }
     }
 
@@ -303,5 +321,18 @@ mod tests {
         };
         let err = validate_field("age", &json!(12), &c).unwrap_err().to_string();
         assert_eq!(err, "field 'age': must be an adult");
+    }
+
+    #[test]
+    fn pattern_is_unanchored_and_string_only() {
+        let c = Constraint { pattern: Some(r"\d{3}".into()), ..Default::default() };
+        assert!(validate_field("code", &json!("ab123cd"), &c).is_ok());
+        assert!(validate_field("code", &json!("ab12cd"), &c).is_err());
+        // Non-strings are not pattern-checked (use `type` for that).
+        assert!(validate_field("code", &json!(12), &c).is_ok());
+
+        let anchored = Constraint { pattern: Some(r"^[A-Z]{3}$".into()), ..Default::default() };
+        assert!(validate_field("ccy", &json!("USD"), &anchored).is_ok());
+        assert!(validate_field("ccy", &json!("USDX"), &anchored).is_err());
     }
 }

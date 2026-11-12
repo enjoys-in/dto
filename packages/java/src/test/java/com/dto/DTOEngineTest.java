@@ -67,4 +67,35 @@ public class DTOEngineTest {
             assertTrue(result.contains("\"part_number\":\"ITEM-777\""));
         }
     }
+
+    @Test
+    public void testCompileOnceTransformMany() {
+        try (DTOEngine engine = new DTOEngine()) {
+            CompiledTransform compiled = engine.compile(
+                "{\"name\":\"T\",\"mappings\":[{\"source\":\"user.name\",\"target\":\"name\"}]}");
+            assertEquals("{\"name\":\"Ada\"}", compiled.transform("{\"user\":{\"name\":\"Ada\"}}"));
+            assertEquals("{\"name\":\"Linus\"}", compiled.transform("{\"user\":{\"name\":\"Linus\"}}"));
+            compiled.close();
+            compiled.close();
+            assertThrows(DTOException.class, () -> compiled.transform("{}"));
+        }
+    }
+
+    @Test
+    public void testErrorsThrowAndOutputsNamedErrorDoNot() {
+        try (DTOEngine engine = new DTOEngine()) {
+            // A real output with a single "error" field is not a failure.
+            assertEquals("{\"error\":\"disk full\"}", engine.transform(
+                "{\"name\":\"T\",\"mappings\":[{\"source\":\"msg\",\"target\":\"error\"}]}",
+                "{\"msg\":\"disk full\"}"));
+
+            DTOException ex = assertThrows(DTOException.class, () -> engine.transform(
+                "{\"name\":\"T\",\"mappings\":[{\"source\":\"id\",\"target\":\"id\"}],\"required\":[\"id\"]}",
+                "[{\"id\":1},{}]"));
+            assertTrue(ex.getMessage().contains("item 1: required field 'id'"));
+
+            assertThrows(DTOException.class, () -> engine.compile(
+                "{\"name\":\"T\",\"mappings\":[{\"source\":\"a\",\"target\":\"b\",\"cast\":\"nope\"}]}"));
+        }
+    }
 }

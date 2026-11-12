@@ -727,9 +727,41 @@ mod tests {
         )
         .contains("unknown type 'nubmer'"));
         assert!(load_error(
-            r#"{"name":"T","mappings":[{"source":"a","target":"a"}],"constraints":{"a":{"pattern":"^x$"}}}"#
+            r#"{"name":"T","mappings":[{"source":"a","target":"a"}],"constraints":{"a":{"pattern":"^(x$"}}}"#
         )
-        .contains("'pattern' is not supported"));
+        .contains("invalid pattern '^(x$'"));
+    }
+
+    #[test]
+    fn pattern_constraint_is_enforced() {
+        let e = engine(
+            r#"{"name":"T","mappings":[{"source":"po","target":"po"}],
+                "constraints":{"po":{"type":"string","pattern":"^PO-\\d{3}$"}}}"#,
+        );
+        assert_eq!(e.transform(&json!({ "po": "PO-123" })).unwrap(), json!({ "po": "PO-123" }));
+        let err = e.transform(&json!([{ "po": "PO-123" }, { "po": "PO-12x" }])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r"validation error on item 1: field 'po': value does not match pattern '^PO-\d{3}$'"
+        );
+    }
+
+    #[test]
+    fn quoted_and_hyphenated_keys_in_recipes() {
+        let e = engine(
+            r#"{"name":"T","mappings":[
+                {"source":"headers.content-type | uppercase","target":"ct"},
+                {"source":"user[\"first name\"] | trim","target":"first"},
+                {"source":"meta['a|b']","target":"ab"}]}"#,
+        );
+        let out = e
+            .transform(&json!({
+                "headers": { "content-type": "json" },
+                "user": { "first name": " Ada " },
+                "meta": { "a|b": 1 }
+            }))
+            .unwrap();
+        assert_eq!(out, json!({ "ct": "JSON", "first": "Ada", "ab": 1 }));
     }
 
     #[test]

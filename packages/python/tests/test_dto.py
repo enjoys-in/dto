@@ -94,3 +94,26 @@ def test_medallion_pipeline():
     assert result["silver_orders"][0]["part_number"] == "PART-100"
     assert result["silver_orders"][0]["quantity"] == 10.0
     assert result["silver_orders"][1]["quantity"] == 25.0
+
+
+def test_compile_once_transform_many():
+    engine = DTOEngine()
+    with engine.compile({"name": "T", "mappings": [{"source": "user.name", "target": "name"}]}) as compiled:
+        assert compiled.transform({"user": {"name": "Ada"}}) == {"name": "Ada"}
+        assert compiled.transform([{"user": {"name": "A"}}, {"user": {"name": "B"}}]) == [{"name": "A"}, {"name": "B"}]
+        assert compiled.transform('{"user":{"name":"Z"}}', raw_json=True) == '{"name":"Z"}'
+    with pytest.raises(RuntimeError, match="has been closed"):
+        compiled.transform({})
+
+
+def test_errors_raise_and_outputs_named_error_do_not():
+    engine = DTOEngine()
+    # A real output with a single "error" field used to be mistaken for a failure.
+    recipe = {"name": "T", "mappings": [{"source": "msg", "target": "error"}]}
+    assert engine.transform(recipe, {"msg": "disk full"}) == {"error": "disk full"}
+
+    strict = {"name": "T", "mappings": [{"source": "id", "target": "id"}], "required": ["id"]}
+    with pytest.raises(RuntimeError, match="item 1: required field 'id'"):
+        engine.transform(strict, [{"id": 1}, {}])
+    with pytest.raises(RuntimeError, match="nope"):
+        engine.compile({"name": "T", "mappings": [{"source": "a", "target": "b", "cast": "nope"}]})

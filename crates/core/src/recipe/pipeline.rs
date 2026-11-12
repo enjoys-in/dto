@@ -42,17 +42,33 @@ pub struct PipelineSpec {
 }
 
 /// Source specification (e.g. bronze staging table).
+///
+/// `filters` is an if-condition on each input record: every `path: value`
+/// pair must be equal for the record to *match* (numbers compare numerically;
+/// a `null` value also matches a missing field). `filter_action` decides what
+/// happens to matching records:
+///
+/// - `"keep"` (default): only matching records are processed; others are skipped.
+/// - `"delete"`: matching records are skipped; all others are processed.
+/// - `"ignore"`: the filter is switched off; every record is processed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceSpec {
     pub id: String,
     #[serde(default)]
     pub bronze_table: Option<String>,
     #[serde(default)]
     pub filters: HashMap<String, Value>,
+    #[serde(default)]
+    pub filter_action: Option<String>,
 }
 
 /// Target specification (e.g. silver table).
+///
+/// Unknown keys are rejected so typos (and the removed `contract` block) are
+/// reported instead of being ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TargetSpec {
     pub table: String,
     #[serde(default)]
@@ -71,17 +87,6 @@ pub struct TargetSpec {
     #[serde(default, alias = "order_by")]
     pub sequence_by: Option<String>,
     pub mappings: Vec<FieldMapping>,
-    #[serde(default)]
-    pub contract: Option<ContractSpec>,
-}
-
-/// Quality & contract specification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContractSpec {
-    #[serde(default)]
-    pub required: Vec<String>,
-    #[serde(default)]
-    pub nullable: Vec<String>,
 }
 
 impl PipelineSpec {
@@ -109,10 +114,40 @@ impl PipelineSpec {
                 ));
             }
         }
+
+        let mut sources: HashMap<&str, Option<SourceFilter>> = HashMap::new();
+        for source in &self.sources {
+            if source.id.is_empty() {
+                return Err("source id cannot be empty".into());
+            }
+            let filter = compile_source_filter(source)
+                .map_err(|e| format!("source '{}': {e}", source.id))?;
+            if sources.insert(source.id.as_str(), filter).is_some() {
+                return Err(format!("duplicate source id '{}'", source.id));
+            }
+        }
+
         let targets = self
             .targets
             .iter()
-            .map(compile_target)
+            .map(|target| {
+                let filter = match target.source_id.as_deref() {
+                    Some(id) => sources.get(id).cloned().ok_or_else(|| {
+                        format!("target '{}': unknown source_id '{id}'", target.table)
+                    })?,
+                    // With exactly one source, targets use it implicitly.
+                    None if self.sources.len() == 1 => sources[self.sources[0].id.as_str()].clone(),
+                    None if self.sources.is_empty() => None,
+                    None => {
+                        return Err(format!(
+                            "target '{}': set source_id (the pipeline defines {} sources)",
+                            target.table,
+                            self.sources.len()
+                        ))
+                    }
+                };
+                compile_target(target, filter)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(CompiledPipeline { targets })
     }
@@ -136,6 +171,81 @@ struct CompiledTarget {
     grain: Grain,
     mappings: Vec<PipeMapping>,
     dedup: Option<Dedup>,
+    /// Record filter inherited from the target's source.
+    filter: Option<SourceFilter>,
+}
+
+/// What happens to records that match a source's `filters`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterAction {
+    Keep,
+    Delete,
+}
+
+/// A compiled `sources[].filters` condition (all pairs must match).
+#[derive(Debug, Clone)]
+struct SourceFilter {
+    conditions: Vec<(DtoPath, Value)>,
+    action: FilterAction,
+}
+
+impl SourceFilter {
+    /// Whether a record passes the filter and should be processed.
+    fn passes(&self, record: &Value) -> bool {
+        let matches = self.conditions.iter().all(|(path, expected)| {
+            match resolver::resolve(record, path) {
+                Some(actual) => values_equal(&actual, expected),
+                // A missing field matches only an explicit `null` condition.
+                None => expected.is_null(),
+            }
+        });
+        match self.action {
+            FilterAction::Keep => matches,
+            FilterAction::Delete => !matches,
+        }
+    }
+}
+
+/// JSON equality, except numbers compare by value (`1` equals `1.0`).
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
+        _ => a == b,
+    }
+}
+
+/// Compile a source's filter. `Ok(None)` means "process every record"
+/// (no filters, or `filter_action: "ignore"`).
+fn compile_source_filter(source: &SourceSpec) -> Result<Option<SourceFilter>, String> {
+    let action = match source.filter_action.as_deref() {
+        None | Some("keep") => Some(FilterAction::Keep),
+        Some("delete") => Some(FilterAction::Delete),
+        Some("ignore") => None,
+        Some(other) => {
+            return Err(format!(
+                "unknown filter_action '{other}' (expected 'keep', 'delete' or 'ignore')"
+            ))
+        }
+    };
+    if source.filters.is_empty() {
+        if source.filter_action.is_some() {
+            return Err("filter_action is set but filters is empty".into());
+        }
+        return Ok(None);
+    }
+    let Some(action) = action else { return Ok(None) };
+
+    let mut keys: Vec<&String> = source.filters.keys().collect();
+    keys.sort();
+    let conditions = keys
+        .into_iter()
+        .map(|key| {
+            let path = tokenizer::parse(key)
+                .map_err(|e| format!("invalid filter path '{key}': {e}"))?;
+            Ok((path, source.filters[key].clone()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Some(SourceFilter { conditions, action }))
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +344,11 @@ impl CompiledTarget {
     fn rows_for(&self, doc: &Value) -> Result<Vec<Value>, String> {
         if !doc.is_object() {
             return Err(format!("expected a JSON object, got {}", json_type_name(doc)));
+        }
+        if let Some(ref filter) = self.filter {
+            if !filter.passes(doc) {
+                return Ok(Vec::new());
+            }
         }
         match &self.grain {
             Grain::Header => Ok(vec![self.row(doc, None)?]),
@@ -377,7 +492,7 @@ fn find_explode_prefix(mappings: &[FieldMapping]) -> Option<String> {
         .or_else(|| mappings.iter().find_map(prefix_of))
 }
 
-fn compile_target(t: &TargetSpec) -> Result<CompiledTarget, String> {
+fn compile_target(t: &TargetSpec, filter: Option<SourceFilter>) -> Result<CompiledTarget, String> {
     if t.table.is_empty() {
         return Err("target table name cannot be empty".into());
     }
@@ -487,7 +602,7 @@ fn compile_target(t: &TargetSpec) -> Result<CompiledTarget, String> {
         }
     };
 
-    Ok(CompiledTarget { table: t.table.clone(), grain, mappings, dedup })
+    Ok(CompiledTarget { table: t.table.clone(), grain, mappings, dedup, filter })
 }
 
 fn compile_mapping(m: &FieldMapping, explode_pattern: Option<&str>) -> Result<PipeMapping, String> {
@@ -726,5 +841,80 @@ mod tests {
         assert!(compile_err(json!({"targets":[{"table":"t","mappings":[
             {"source":"k","target":"k","cast":"nope"}]}]}))
             .contains("nope"));
+    }
+
+    // ── Source filters ──────────────────────────────────────────────────
+
+    fn filtered(action: Option<&str>, input: Value) -> Vec<Value> {
+        let mut source = json!({"id":"item","filters":{"source_system":"api_ingest","meta.entity":"part"}});
+        if let Some(a) = action {
+            source["filter_action"] = json!(a);
+        }
+        let spec = json!({"sources":[source],"targets":[{"table":"t","source_id":"item",
+            "mappings":[{"source":"id","target":"id"}]}]});
+        run(spec, input).unwrap().remove("t").unwrap()
+    }
+
+    fn records() -> Value {
+        json!([
+            {"id":1,"source_system":"api_ingest","meta":{"entity":"part"}},
+            {"id":2,"source_system":"api_ingest","meta":{"entity":"order"}},
+            {"id":3,"source_system":"manual","meta":{"entity":"part"}},
+            {"id":4}
+        ])
+    }
+
+    #[test]
+    fn filter_keep_processes_only_matching_records() {
+        assert_eq!(filtered(None, records()), vec![json!({"id":1})]);
+        assert_eq!(filtered(Some("keep"), records()), vec![json!({"id":1})]);
+    }
+
+    #[test]
+    fn filter_delete_drops_matching_records() {
+        assert_eq!(filtered(Some("delete"), records()), vec![json!({"id":2}), json!({"id":3}), json!({"id":4})]);
+    }
+
+    #[test]
+    fn filter_ignore_processes_everything() {
+        assert_eq!(filtered(Some("ignore"), records()).len(), 4);
+    }
+
+    #[test]
+    fn filter_compares_numbers_by_value_and_null_matches_missing() {
+        let spec = json!({"sources":[{"id":"s","filters":{"v":1,"deleted_at":null}}],
+            "targets":[{"table":"t","mappings":[{"source":"id","target":"id"}]}]});
+        let out = run(spec, json!([{"id":"a","v":1.0},{"id":"b","v":1,"deleted_at":"2024-01-01"},{"id":"c","v":2}]))
+            .unwrap();
+        // Single source is applied implicitly when the target has no source_id.
+        assert_eq!(out["t"], vec![json!({"id":"a"})]);
+    }
+
+    #[test]
+    fn filter_configuration_mistakes_fail_at_compile_time() {
+        let t = json!([{"table":"t","source_id":"item","mappings":[{"source":"k","target":"k"}]}]);
+        assert!(compile_err(json!({"sources":[{"id":"item","filters":{"a":1},"filter_action":"skip"}],"targets":t}))
+            .contains("unknown filter_action 'skip'"));
+        assert!(compile_err(json!({"sources":[{"id":"other"}],"targets":t})).contains("unknown source_id 'item'"));
+        assert!(compile_err(json!({"sources":[{"id":"item"},{"id":"item"}],"targets":t})).contains("duplicate source id"));
+        assert!(compile_err(json!({"sources":[{"id":"a"},{"id":"b"}],
+            "targets":[{"table":"t","mappings":[{"source":"k","target":"k"}]}]}))
+            .contains("set source_id"));
+        assert!(compile_err(json!({"sources":[{"id":"item","filter_action":"keep"}],"targets":t}))
+            .contains("filters is empty"));
+    }
+
+    #[test]
+    fn contract_and_unknown_target_keys_are_rejected() {
+        let err = PipelineSpec::from_value(json!({"targets":[{"table":"t",
+            "mappings":[{"source":"k","target":"k"}],"contract":{"required":["k"]}}]}))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field `contract`"), "got {err}");
+        let err = PipelineSpec::from_value(json!({"targets":[{"table":"t","dedup_stratgy":"latest",
+            "mappings":[{"source":"k","target":"k"}]}]}))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("dedup_stratgy"), "got {err}");
     }
 }

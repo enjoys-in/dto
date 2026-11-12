@@ -60,11 +60,19 @@ impl fmt::Display for DtoPath {
         let mut first = true;
         for seg in &self.segments {
             match seg {
-                Segment::Field(name) => {
+                Segment::Field(name)
+                    if !name.is_empty()
+                        && name.chars().all(crate::path::tokenizer::is_bare_key_char) =>
+                {
                     if !first {
                         write!(f, ".")?;
                     }
                     write!(f, "{name}")?;
+                }
+                Segment::Field(name) => {
+                    // Keys with other characters round-trip as `["..."]`.
+                    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+                    write!(f, "[\"{escaped}\"]")?;
                 }
                 Segment::Index(i) => {
                     write!(f, "[{i}]")?;

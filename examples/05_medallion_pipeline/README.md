@@ -15,7 +15,10 @@ This example demonstrates an **Enterprise Medallion Architecture pipeline** conv
    }
    ```
 
-2. **Multi-Target Routing**:
+2. **Source Filter (`filters` + `filter_action`)**:
+   The `item` source keeps only records where `source_system == "api_ingest"` and `source_entity == "part"` (`"filter_action": "keep"`). Use `"delete"` to drop matching records instead, or `"ignore"` to switch the filter off. Every target reads from this source via `"source_id": "item"`.
+
+   **Multi-Target Routing**:
    A single incoming bronze item document is automatically routed and fanned out into **6 distinct silver tables**:
    - `silver_part` (Part master header)
    - `silver_purchase_order` (PO headers)
