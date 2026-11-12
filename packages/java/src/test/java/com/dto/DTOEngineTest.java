@@ -98,4 +98,24 @@ public class DTOEngineTest {
                 "{\"name\":\"T\",\"mappings\":[{\"source\":\"a\",\"target\":\"b\",\"cast\":\"nope\"}]}"));
         }
     }
+
+    @Test
+    public void testSchemaCacheIsBoundedAndCompiledHandlesAreFreed() {
+        try (DTOEngine engine = new DTOEngine()) {
+            String recipe = "{\"name\":\"T\",\"mappings\":[{\"source\":\"a\",\"target\":\"b\"}]}";
+            engine.transform(recipe, "{\"a\":1}");
+            engine.transform(recipe, "{\"a\":2}");
+            assertEquals(1, engine.liveHandles());
+            for (int i = 0; i < 100; i++) {
+                engine.transform("{\"name\":\"T\",\"mappings\":[{\"source\":\"a\",\"target\":\"f" + i + "\"}]}",
+                    "{\"a\":1}");
+            }
+            assertEquals(64, engine.liveHandles());
+
+            CompiledTransform compiled = engine.compile(recipe);
+            assertEquals(65, engine.liveHandles());
+            compiled.close();
+            assertEquals(64, engine.liveHandles());
+        }
+    }
 }

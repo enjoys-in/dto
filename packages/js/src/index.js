@@ -8,21 +8,38 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const STATUS_OK = 0;
 
-const toJsonBytes = (value) =>
-  encoder.encode(typeof value === 'string' ? value : JSON.stringify(value));
+/** Compiled schemas kept by `transform()` (least recently used are freed first). */
+const SCHEMA_CACHE_SIZE = 64;
+
+const toJson = (value) => (typeof value === 'string' ? value : JSON.stringify(value));
+
+/** Frees compiled handles whose CompiledTransform was garbage-collected without free(). */
+const finalizer =
+  typeof FinalizationRegistry === 'function'
+    ? new FinalizationRegistry(({ engine, handle }) => engine._freeHandle(handle))
+    : null;
 
 /**
  * DTO data transformation engine powered by WebAssembly.
  *
- * Use `compile(recipe)` once and call `.transform(data)` many times to avoid
- * re-parsing the recipe on every call. `transform(recipe, data)` is a one-shot
- * convenience that compiles, transforms and frees.
+ * - `transform(recipe, data)` caches compiled recipes (up to 64, LRU), so
+ *   repeated calls with the same recipe do not re-parse it.
+ * - `compile(recipe)` returns a handle you control; call `.free()` when done
+ *   (it is also freed automatically when garbage-collected).
+ *
+ * WebAssembly memory grows to the largest input processed and never shrinks;
+ * to release it, drop the engine and create a new one with `DTOEngine.init()`.
+ * If the WebAssembly instance traps, the engine refuses further calls.
  */
 export class DTOEngine {
   constructor(wasmInstance) {
     this.instance = wasmInstance;
     this.exports = wasmInstance.exports;
     this.memory = this.exports.memory;
+    /** @type {Map<string, number>} schema JSON -> handle, in LRU order */
+    this._cache = new Map();
+    /** @type {Error | null} set when the instance trapped */
+    this._broken = null;
   }
 
   /**
@@ -58,44 +75,102 @@ export class DTOEngine {
    * @returns {CompiledTransform} Call `.free()` when done.
    */
   compile(schema) {
-    const handle = this._withBytes(toJsonBytes(schema), (ptr, len) =>
-      this._readStatus(this.exports.dto_engine_new(ptr, len))
-    );
-    return new CompiledTransform(this, Number(handle));
+    return new CompiledTransform(this, this._compile(toJson(schema)));
   }
 
   /**
    * Transforms input JSON data according to the given Recipe or JSON Schema.
+   * The compiled recipe is cached for later calls.
    *
    * @param {object | Array | string} schema - Recipe or JSON Schema (object or JSON string).
    * @param {object | Array | string} data - Input object or array of objects.
    * @returns {any} Transformed JavaScript object or array.
    */
   transform(schema, data) {
-    const compiled = this.compile(schema);
-    try {
-      return compiled.transform(data);
-    } finally {
-      compiled.free();
+    return JSON.parse(this._transformHandle(this._cachedHandle(toJson(schema)), data));
+  }
+
+  /** Number of compiled recipes alive inside WebAssembly (cache + compile()). */
+  get liveHandles() {
+    return this._call(() => this.exports.dto_engine_count());
+  }
+
+  /** Current WebAssembly memory size in bytes (grows, never shrinks). */
+  get memoryBytes() {
+    return this.memory.buffer.byteLength;
+  }
+
+  // ── internals ──────────────────────────────────────────────────────
+
+  _cachedHandle(schemaJson) {
+    const hit = this._cache.get(schemaJson);
+    if (hit !== undefined) {
+      this._cache.delete(schemaJson); // move to most-recently-used
+      this._cache.set(schemaJson, hit);
+      return hit;
     }
+    const handle = this._compile(schemaJson);
+    this._cache.set(schemaJson, handle);
+    if (this._cache.size > SCHEMA_CACHE_SIZE) {
+      const [oldestKey, oldestHandle] = this._cache.entries().next().value;
+      this._cache.delete(oldestKey);
+      this._freeHandle(oldestHandle);
+    }
+    return handle;
+  }
+
+  _compile(schemaJson) {
+    const text = this._withBytes(encoder.encode(schemaJson), (ptr, len) =>
+      this._readStatus(this._call(() => this.exports.dto_engine_new(ptr, len)))
+    );
+    return Number(text);
   }
 
   /** @internal Transform with a compiled handle; returns the output JSON text. */
   _transformHandle(handle, data) {
-    return this._withBytes(toJsonBytes(data), (ptr, len) =>
-      this._readStatus(this.exports.dto_engine_transform(handle, ptr, len))
+    return this._withBytes(encoder.encode(toJson(data)), (ptr, len) =>
+      this._readStatus(this._call(() => this.exports.dto_engine_transform(handle, ptr, len)))
     );
+  }
+
+  /** @internal Free a handle; never throws (used by free() and the finalizer). */
+  _freeHandle(handle) {
+    if (this._broken) return;
+    try {
+      this._call(() => this.exports.dto_engine_free(handle));
+    } catch {
+      // The instance trapped; nothing left to free.
+    }
+  }
+
+  /** Run a WebAssembly call, marking the engine unusable if it traps. */
+  _call(fn) {
+    if (this._broken) {
+      throw new Error(
+        `DTO transform error: the WebAssembly instance trapped earlier (${this._broken.message}); create a new DTOEngine`
+      );
+    }
+    try {
+      return fn();
+    } catch (err) {
+      if (err instanceof WebAssembly.RuntimeError) {
+        this._broken = err;
+        this._cache.clear();
+        throw new Error(`DTO transform error: WebAssembly trap: ${err.message}`, { cause: err });
+      }
+      throw err;
+    }
   }
 
   /** Copy bytes into WASM memory for the duration of `fn(ptr, len)`. */
   _withBytes(bytes, fn) {
-    const ptr = this.exports.dto_alloc(bytes.length);
-    // Create the view after allocating: allocation may grow (and detach) memory.
-    new Uint8Array(this.memory.buffer, ptr, bytes.length).set(bytes);
+    const ptr = this._call(() => this.exports.dto_alloc(bytes.length));
     try {
+      // Create the view after allocating: allocation may grow (and detach) memory.
+      new Uint8Array(this.memory.buffer, ptr, bytes.length).set(bytes);
       return fn(ptr, bytes.length);
     } finally {
-      this.exports.dto_dealloc(ptr, bytes.length);
+      if (!this._broken) this.exports.dto_dealloc(ptr, bytes.length);
     }
   }
 
@@ -105,7 +180,7 @@ export class DTOEngine {
     const len = view.getUint32(resPtr, true);
     const status = view.getUint8(resPtr + 4);
     const text = decoder.decode(new Uint8Array(this.memory.buffer, resPtr + 5, len));
-    this.exports.dto_dealloc(resPtr, len + 5);
+    this._call(() => this.exports.dto_dealloc(resPtr, len + 5));
     if (status !== STATUS_OK) {
       throw new Error(`DTO transform error: ${text}`);
     }
@@ -120,6 +195,7 @@ export class CompiledTransform {
   constructor(engine, handle) {
     this.engine = engine;
     this.handle = handle;
+    finalizer?.register(this, { engine, handle }, this);
   }
 
   /**
@@ -145,7 +221,8 @@ export class CompiledTransform {
   /** Releases the compiled engine inside WebAssembly. Safe to call twice. */
   free() {
     if (this.handle !== null) {
-      this.engine.exports.dto_engine_free(this.handle);
+      finalizer?.unregister(this);
+      this.engine._freeHandle(this.handle);
       this.handle = null;
     }
   }

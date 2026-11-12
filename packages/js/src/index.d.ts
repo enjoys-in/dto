@@ -21,13 +21,20 @@ export class DTOEngine {
   compile(schema: Record<string, any> | string): CompiledTransform;
 
   /**
-   * One-shot transform: compiles the schema, transforms `data`, and frees it.
+   * Transforms `data` with `schema`. The compiled schema is cached (up to 64,
+   * least recently used freed first), so repeated calls do not re-parse it.
    *
    * @param schema Recipe or JSON Schema (object or JSON string).
    * @param data Input object or array of objects.
    * @returns Transformed JavaScript object or array.
    */
   transform<T = any>(schema: Record<string, any> | string, data: Json): T;
+
+  /** Number of compiled recipes alive inside WebAssembly (cache + compile()). */
+  readonly liveHandles: number;
+
+  /** Current WebAssembly memory size in bytes (grows, never shrinks). */
+  readonly memoryBytes: number;
 }
 
 /**

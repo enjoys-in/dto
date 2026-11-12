@@ -117,3 +117,48 @@ def test_errors_raise_and_outputs_named_error_do_not():
         engine.transform(strict, [{"id": 1}, {}])
     with pytest.raises(RuntimeError, match="nope"):
         engine.compile({"name": "T", "mappings": [{"source": "a", "target": "b", "cast": "nope"}]})
+
+
+def test_schema_cache_reuses_and_stays_bounded():
+    engine = DTOEngine()
+    recipe = {"name": "T", "mappings": [{"source": "a", "target": "b"}]}
+    engine.transform(recipe, {"a": 1})
+    engine.transform(recipe, {"a": 2})
+    assert engine.live_handles == 1
+    for i in range(100):
+        engine.transform({"name": "T", "mappings": [{"source": "a", "target": f"f{i}"}]}, {"a": i})
+    assert engine.live_handles == 64
+    with pytest.raises(RuntimeError):
+        engine.transform({"name": "T", "mappings": [{"source": "a", "target": "b", "cast": "nope"}]}, {})
+    assert engine.live_handles == 64
+
+
+def test_forgotten_compiled_handles_are_freed_by_gc():
+    import gc
+
+    engine = DTOEngine()
+    recipe = {"name": "T", "mappings": [{"source": "a", "target": "b"}]}
+    engine.compile(recipe).close()
+    assert engine.live_handles == 0
+    for _ in range(50):
+        engine.compile(recipe)  # never closed
+    gc.collect()
+    assert engine.live_handles == 0
+
+
+def test_trapped_instance_is_not_reused():
+    import wasmtime
+
+    engine = DTOEngine()
+    recipe = {"name": "T", "mappings": [{"source": "a", "target": "b"}]}
+
+    def trap(*_args):
+        raise wasmtime.Trap("unreachable")
+
+    real = engine._engine_transform
+    engine._engine_transform = trap
+    with pytest.raises(RuntimeError, match="WebAssembly trap"):
+        engine.transform(recipe, {"a": 1})
+    engine._engine_transform = real
+    with pytest.raises(RuntimeError, match="trapped earlier"):
+        engine.transform(recipe, {"a": 1})

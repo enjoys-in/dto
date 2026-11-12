@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -249,4 +250,130 @@ func TestConcurrentTransformsUseSeparateInstances(t *testing.T) {
 	for err := range errs {
 		t.Error(err)
 	}
+}
+
+func bigArray(n int) []byte {
+	var b strings.Builder
+	b.WriteString("[")
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"id":%d,"name":"user-%d","pad":"%s"}`, i, i, strings.Repeat("x", 40))
+	}
+	b.WriteString("]")
+	return []byte(b.String())
+}
+
+// Regression: sync.Pool dropped instances on GC while wazero kept them alive,
+// leaking ~75 MB per GC cycle for this workload.
+func TestPoolDoesNotLeakMemoryAcrossGC(t *testing.T) {
+	ctx := context.Background()
+	engine, err := New(ctx)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer engine.Close(ctx)
+
+	recipe := []byte(`{"name":"T","mappings":[{"source":"id","target":"id"},{"source":"name | uppercase","target":"name"}]}`)
+	data := bigArray(50000)
+	var m runtime.MemStats
+	var first uint64
+	for i := 0; i < 6; i++ {
+		if _, err := engine.Transform(recipe, data); err != nil {
+			t.Fatalf("Transform: %v", err)
+		}
+		runtime.GC()
+		runtime.GC()
+		runtime.ReadMemStats(&m)
+		if i == 0 {
+			first = m.HeapInuse
+		}
+	}
+	if grown := int64(m.HeapInuse) - int64(first); grown > 40<<20 {
+		t.Fatalf("heap grew by %d MB across GC cycles", grown>>20)
+	}
+}
+
+func TestSchemaCacheReusesAndBoundsHandles(t *testing.T) {
+	ctx := context.Background()
+	engine, err := New(ctx)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer engine.Close(ctx)
+
+	inst, err := engine.acquire()
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer engine.release(inst)
+
+	schema := func(i int) []byte {
+		return []byte(fmt.Sprintf(`{"name":"T","mappings":[{"source":"a","target":"f%d"}]}`, i))
+	}
+	h1, _ := inst.cachedHandle(ctx, schema(0))
+	h2, _ := inst.cachedHandle(ctx, schema(0))
+	if h1 != h2 {
+		t.Fatalf("cache miss for identical schema: %d vs %d", h1, h2)
+	}
+	for i := 0; i < schemaCacheSize+20; i++ {
+		if _, err := inst.cachedHandle(ctx, schema(i)); err != nil {
+			t.Fatalf("cachedHandle: %v", err)
+		}
+	}
+	if n := inst.liveHandles(ctx); n != schemaCacheSize {
+		t.Fatalf("expected %d live handles, got %d", schemaCacheSize, n)
+	}
+	// Failed compiles are not cached and leave nothing behind.
+	if _, err := inst.cachedHandle(ctx, []byte(`{"name":"T","mappings":[{"source":"a","target":"b","cast":"nope"}]}`)); err == nil {
+		t.Fatal("expected compile error")
+	}
+	if n := inst.liveHandles(ctx); n != schemaCacheSize {
+		t.Fatalf("failed compile leaked a handle: %d", n)
+	}
+}
+
+func TestBrokenInstancesAreReplaced(t *testing.T) {
+	ctx := context.Background()
+	engine, err := New(ctx)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer engine.Close(ctx)
+
+	inst, _ := engine.acquire()
+	inst.broken = true
+	engine.release(inst)
+	next, _ := engine.acquire()
+	defer engine.release(next)
+	if next == inst {
+		t.Fatal("a broken instance was handed out again")
+	}
+	if len(engine.slots) != 1 {
+		t.Fatalf("expected 1 live instance, got %d", len(engine.slots))
+	}
+}
+
+func TestUseAfterEngineClose(t *testing.T) {
+	ctx := context.Background()
+	engine, err := New(ctx)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	recipe := []byte(`{"name":"T","mappings":[{"source":"a","target":"b"}]}`)
+	compiled, err := engine.Compile(recipe)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if err := engine.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := engine.Transform(recipe, []byte(`{}`)); !errors.Is(err, ErrClosed) {
+		t.Fatalf("expected ErrClosed, got %v", err)
+	}
+	if _, err := compiled.Transform([]byte(`{}`)); !errors.Is(err, ErrClosed) {
+		t.Fatalf("expected ErrClosed, got %v", err)
+	}
+	_ = compiled.Close()
 }

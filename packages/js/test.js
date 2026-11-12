@@ -124,3 +124,46 @@ test('JS/TS errors are thrown and outputs named "error" are not', async () => {
   );
   assert.throws(() => engine.compile({ name: 'T', mappings: [{ source: 'a', target: 'b', cast: 'nope' }] }), /nope/);
 });
+
+test('JS/TS schema cache reuses compiled recipes and stays bounded', async () => {
+  const engine = await DTOEngine.init();
+  const recipe = { name: 'T', mappings: [{ source: 'a', target: 'b' }] };
+  engine.transform(recipe, { a: 1 });
+  engine.transform(recipe, { a: 2 });
+  assert.equal(engine.liveHandles, 1);
+  for (let i = 0; i < 100; i++) {
+    engine.transform({ name: 'T', mappings: [{ source: 'a', target: `f${i}` }] }, { a: i });
+  }
+  assert.equal(engine.liveHandles, 64);
+  // Failed compiles are not cached and leave no handle behind.
+  assert.throws(() => engine.transform({ name: 'T', mappings: [{ source: 'a', target: 'b', cast: 'nope' }] }, {}));
+  assert.equal(engine.liveHandles, 64);
+});
+
+test('JS/TS compiled handles are freed explicitly or by the garbage collector', async () => {
+  const engine = await DTOEngine.init();
+  const recipe = { name: 'T', mappings: [{ source: 'a', target: 'b' }] };
+  const before = engine.liveHandles;
+  engine.compile(recipe).free();
+  assert.equal(engine.liveHandles, before);
+
+  if (typeof globalThis.gc === 'function') {
+    (() => { for (let i = 0; i < 50; i++) engine.compile(recipe); })(); // never freed
+    for (let i = 0; i < 20 && engine.liveHandles > before; i++) {
+      globalThis.gc();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(engine.liveHandles, before, 'finalizer should free forgotten handles');
+  }
+});
+
+test('JS/TS a trapped instance is not reused', async () => {
+  const engine = await DTOEngine.init();
+  const recipe = { name: 'T', mappings: [{ source: 'a', target: 'b' }] };
+  // Simulate a trap inside WebAssembly.
+  const real = engine.exports;
+  engine.exports = { ...real, dto_engine_transform: () => { throw new WebAssembly.RuntimeError('unreachable'); } };
+  assert.throws(() => engine.transform(recipe, { a: 1 }), /WebAssembly trap/);
+  engine.exports = real;
+  assert.throws(() => engine.transform(recipe, { a: 1 }), /trapped earlier/);
+});

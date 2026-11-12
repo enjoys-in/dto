@@ -333,8 +333,18 @@ public class Main {
 
 ### Errors and performance in the SDKs
 - Every SDK reports failures as an error: Go returns an `error`, Python raises `RuntimeError`, JS throws `Error`, and Java throws `DTOException`. The message includes the failing record's position, e.g. `item 1: required field 'id' is missing`. A successful output that happens to contain only an `error` field is returned normally.
-- Each call copies JSON text into WebAssembly and back, and the WASM build runs on a single thread. On one 100k-record batch the JS SDK reaches ~117k records/s with `compile()` (~84k without). For many small calls, `compile()` makes a large difference: ~97k vs ~26k records/s for 20k one-record calls. A hand-written JS mapping is faster still, so the SDKs' value is identical behaviour across languages, not raw speed. For maximum throughput, use the Rust crate or the CLI.
-- Concurrency: Go `Engine.Transform` is safe across goroutines; a Go `Compiled` serializes its calls. The Java engine is synchronized. Python and JS engines are single-threaded.
+- Each call copies JSON text into WebAssembly and back, and the WASM build runs on a single thread. In the JS SDK, one 100k-record batch runs at ~125k records/s. For 20k one-record calls, `transform()` runs at ~73k records/s (its cache saves re-parsing the recipe, but it still serializes the recipe to look it up) and `compile()` at ~103k. A hand-written JS mapping is faster still, so the SDKs' value is identical behaviour across languages, not raw speed. For maximum throughput, use the Rust crate or the CLI.
+
+### Caching, concurrency and memory in the SDKs
+| | Go | Python | JS | Java |
+|---|---|---|---|---|
+| `transform()` recipe cache | 64 per instance, LRU | 64, LRU | 64, LRU | 64, LRU |
+| Concurrency | `Engine` pool: up to GOMAXPROCS instances, extra callers wait; `Compiled` serializes calls | one engine per thread | single-threaded | engine is `synchronized` |
+| Forgotten `close()`/`free()` | finalizer releases the instance | `weakref.finalize` frees the handle | `FinalizationRegistry` frees the handle | `Cleaner` frees the handle |
+| WebAssembly memory (never shrinks) | instances above 64 MB are closed and replaced after use | drop the engine to release it | drop the engine to release it | drop the engine to release it |
+| Instance traps (crash inside WASM) | instance discarded and replaced | engine refuses further calls | engine refuses further calls | engine refuses further calls |
+
+`liveHandles` (JS/Java) / `live_handles` (Python) reports how many compiled recipes exist inside WebAssembly, which the tests use to check for leaks.
 
 ---
 

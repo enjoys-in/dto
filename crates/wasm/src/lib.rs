@@ -282,6 +282,12 @@ pub extern "C" fn dto_engine_free(handle: u32) -> u32 {
     ENGINES.with(|cell| u32::from(cell.borrow_mut().engines.remove(&handle).is_some()))
 }
 
+/// Number of live compiled engines in this instance (for leak checks).
+#[no_mangle]
+pub extern "C" fn dto_engine_count() -> u32 {
+    ENGINES.with(|cell| cell.borrow().engines.len() as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
