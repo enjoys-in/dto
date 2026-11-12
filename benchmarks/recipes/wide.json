@@ -1,0 +1,32 @@
+{
+  "name": "W",
+  "mappings": [
+    {
+      "source": "id",
+      "target": "po"
+    },
+    {
+      "source": "supplier.name | uppercase",
+      "target": "supplier"
+    },
+    {
+      "source": "supplier.address.city",
+      "target": "city"
+    },
+    {
+      "source": "lines[*].sku",
+      "target": "skus"
+    },
+    {
+      "source": "lines[*].qty",
+      "target": "qtys"
+    },
+    {
+      "source": "attr_7",
+      "target": "a7"
+    }
+  ],
+  "required": [
+    "po"
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "name": "B",
+  "mappings": [
+    {
+      "source": "id",
+      "target": "userId"
+    },
+    {
+      "source": "profile.first_name | trim | lowercase",
+      "target": "firstName"
+    },
+    {
+      "source": "profile.address.city",
+      "target": "city"
+    },
+    {
+      "source": "contact.emails[0]",
+      "target": "email"
+    },
+    {
+      "source": "account.score",
+      "target": "score",
+      "cast": "decimal"
+    },
+    {
+      "source": "roles[*].name",
+      "target": "roles"
+    }
+  ]
+}

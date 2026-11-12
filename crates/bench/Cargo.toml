@@ -1,0 +1,17 @@
+[package]
+name = "dto_bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Benchmarks and synthetic data generators for the DTO engine (not published)"
+publish = false
+
+[dependencies]
+dto_core = { path = "../core" }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+
+[[bin]]
+name = "dto-bench"
+path = "src/main.rs"

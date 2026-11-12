@@ -361,11 +361,35 @@ cat data.json | cargo run --bin dto -- transform -s recipe.json
 # 2,000 at a time, so memory stays near the file size
 # (95 MB / 300k-record file: ~3.0 s, ~112 MB peak, versus ~1.9 GB when fully parsed).
 
-# --chunk-size also reads the file incrementally, so memory stays around one chunk
-# regardless of file size (same file: ~3.5 s, ~23 MB peak).
+# Fixed batching: read the file incrementally and transform N records at a time.
+# Memory depends on row width: 5,000 narrow rows ~41 MB, 5,000 wide (4 KB) rows ~121 MB.
+cargo run --release --bin dto -- transform -s recipe.json -i big.json --chunk-size 5000
+
+# Auto batching: cap the memory held for records instead of the row count.
+# Each row's in-memory size is estimated as it is read, and a batch is
+# transformed when its inputs plus outputs would reach the cap, so narrow rows
+# get large batches and wide rows small ones. --stats prints what was chosen.
+cargo run --release --bin dto -- transform -s recipe.json -i big.json --max-memory 64MB --stats
+# dto: 300000 records in 34 batches (records per batch: min 1840, avg 8823, max 9301), largest batch ~64.0 MB estimated
+
 # Pipelines are always processed whole because deduplication needs every record,
-# so --chunk-size is rejected for them.
-cargo run --release --bin dto -- transform -s recipe.json -i big.json --chunk-size 2000
+# so --chunk-size and --max-memory are rejected for them.
+```
+
+Measured peak process memory (12 threads):
+
+| Mode | 300k narrow rows (0.3 KB) | 50k wide rows (3.9 KB) |
+|---|---|---|
+| `--chunk-size 5000` | 41 MB (5,000 rows/batch) | 121 MB (5,000 rows/batch) |
+| `--max-memory 16MB` | 24 MB (~2,300 rows/batch) | 24 MB (~640 rows/batch) |
+| `--max-memory 64MB` | 68 MB (~8,800 rows/batch) | 68 MB (~2,400 rows/batch) |
+| `--max-memory 256MB` | 242 MB (~30,000 rows/batch) | 231 MB (~8,300 rows/batch) |
+
+The cap covers the records; the process itself adds roughly 8–20 MB. A single row larger than the cap is processed on its own. Very small caps make batches small, which spreads less work across cores.
+
+From Rust, the same two modes are `DtoEngine::transform_stream(items, rows, on_chunk)` and `DtoEngine::transform_stream_auto(items, max_bytes, on_chunk)`. The second returns `StreamStats`. `estimate_heap_bytes(&value)` exposes the per-row estimate, which lands within ~10–15% of measured memory and errs high.
+
+```bash
 
 # Validate syntax and structure of a recipe/schema
 cargo run --bin dto -- validate -s recipe.json
@@ -376,141 +400,23 @@ cargo run --bin dto -- functions
 
 ---
 
-## 5. Performance Benchmarks (100k+ Records, Multi-Threaded Rayon)
+## 5. Performance Benchmarks
 
-Benchmarked on **Windows (12 Logical CPU Cores, 12 Rayon Worker Threads)** using high-resolution hardware timers, `GetProcessMemoryInfo` for Working Set (RSS) RAM tracking, and `GetProcessTimes` for multi-core CPU utilization.
+Full results, methodology and the script that reproduces them are in **[benchmarks/README.md](benchmarks/README.md)**. They were measured on an Intel i5-10400 (6 cores / 12 threads).
 
-> **What these numbers measure:** `dto bench` times only the in-memory transform step. The input is already a parsed `serde_json::Value` and the output is not serialized. End-to-end runs that read, parse and write JSON are slower. On the same 12-thread machine, `dto transform` on a 95 MB / 300k-record file takes ~3.0 s (~100k records/s, ~112 MB peak), or ~3.5 s with `--chunk-size 2000` (~23 MB peak). The SDKs run the single-threaded WASM build and copy JSON text across the boundary on every call (see "Errors and performance in the SDKs").
->
-> The tables below were recorded before paths and transform chains were compiled once per batch. With that change, the same `dto bench` runs measure ~1.49M records/s for the default recipe on 12 threads (~273k on 1 thread) and ~413k records/s for the 6.4 KB enterprise records with `--chunk-size 2000`.
+| Scenario | Result |
+|---|---|
+| Rust engine, 250k records, all held in memory | 275k records/s on 1 thread → 1.06M on 6 → 1.54M on 12; 1.76 GB peak |
+| Same, 5,000 records per batch | 1.37M records/s at **45 MB** peak; 1M records in ~0.8 s at 46 MB |
+| `dto transform`, 95 MB / 300k-record file | ~2.6–3.0 s, ~110 MB peak (reading and writing JSON dominate, so more cores add little) |
+| `dto transform --max-memory 64MB` | ~68 MB peak for both narrow (0.3 KB) and wide (3.9 KB) rows |
+| JS SDK (WASM) | ~92–125k records/s |
 
-### 100,000-Record Array Transformation
-
-```
-================================================================================
-               DTO ENGINE 100K+ RECORD ARRAY BENCHMARK                         
-================================================================================
- Hardware / Environment:
-   • CPU Threads / Workers : 12 parallel Rayon threads
-   • Target Record Count   : 100,000 objects
-   • Benchmark Iterations  : 3 runs (after 1 warmup)
-
- Schema / Recipe: Realistic Recipe (9 nested mappings with inline pipes & wildcards)
-
- 📊 Execution Results:
- ┌──────┬──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐
- │ Run  │ Elapsed Time │  Throughput  │ Avg Latency  │ CPU Utilized │ Peak RSS RAM │
- ├──────┼──────────────┼──────────────┼──────────────┼──────────────┼──────────────┤
- │ #1   │   169.49ms   │ 589,995 rec/s│    1.69 µs/r │   9.31x core │    714.82 MB │
- │ #2   │   169.44ms   │ 590,173 rec/s│    1.69 µs/r │  10.14x core │    714.82 MB │
- │ #3   │   159.69ms   │ 626,194 rec/s│    1.60 µs/r │  10.57x core │    715.32 MB │
- └──────┴──────────────┴──────────────┴──────────────┴──────────────┴──────────────┘
-
- 🏆 Summary:
-   • Fastest Run           : 159.69 ms
-   • Average Elapsed Time  : 166.21 ms
-   • Peak Throughput       : 626,194 records / second
-   • Average Item Latency  : 1.662 microseconds per item
-   • Parallel CPU Scaling  : 10.01x logical core utilization
-   • Peak Working Set RSS  : 715.32 MB
-================================================================================
-```
-
-> **Key takeaway**: Throughput peaks at ~626,000 records/sec on 100k items because Rayon's work-stealing thread pool achieves optimal CPU cache locality across all 12 cores.
-
-### Scaling Across Different Array Sizes
-
-| Record Count | Wall-Clock Time | Peak Throughput | Average Latency | Peak RAM (RSS) |
-|---|---|---|---|---|
-| **10,000 (10k)** | **25.43 ms** | 393,270 rec/s | 2.54 $\mu\text{s}$ | 78 MB |
-| **100,000 (100k)** | **159.69 ms** | **626,194 rec/s** | **1.60 $\mu\text{s}$** | **715 MB** |
-| **250,000 (250k)** | **547.11 ms** | 456,948 rec/s | 2.19 $\mu\text{s}$ | 1.77 GB |
-
-### 100,000 Enterprise Records (6.4 KB): In-Memory vs Micro-Batch Streaming
-
-For realistic enterprise workloads (e.g. ERP purchase orders with ~60 fields, nested addresses, financial tax breakdowns, and multiple line items totaling **~6.4 KB per record**):
-
-| Execution Mode | 100k Record Processing | Peak Working Set RSS | Throughput | Average Item Latency |
-|---|---|---|---|---|
-| **In-Memory All-at-Once** (Full DOM in RAM) | Loads all 100k records + outputs simultaneously | **~15 GB Peak RAM** *(OOM risk on $\le$16 GB RAM machines)* | ~236,000 rec/s | 4.22 $\mu\text{s}$ |
-| **Micro-Batch Streaming** (`chunk-size 2000`) | Streams micro-batches of 2,000 records & releases memory | **77.37 MB Peak RSS** *(Strictly bounded < 150 MB)* | **245,962 rec/s** | **4.06 $\mu\text{s}$** |
-
-```
-================================================================================
-               DTO ENGINE 100K+ RECORD ARRAY BENCHMARK                         
-================================================================================
- Hardware / Environment:
-   • CPU Threads / Workers : 12 parallel Rayon threads
-   • Target Record Count   : 100,000 objects
-   • Payload Size / Record : 6.4 KB (approx)
-   • Execution Strategy    : Micro-Batch Streaming (chunk size: 2000 items)
-   • Benchmark Iterations  : 3 runs (after 1 warmup)
-
- Schema / Recipe: Enterprise Procurement Recipe (18 mappings)
-
- 🌊 Streaming Pipeline Active: micro-batches of 2000 items processed & released.
-
- 📊 Execution Results (Streaming Micro-Batch Mode):
- ┌──────┬──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐
- │ Run  │ Elapsed Time │  Throughput  │ Avg Latency  │ CPU Utilized │ Peak RSS RAM │
- ├──────┼──────────────┼──────────────┼──────────────┼──────────────┼──────────────┤
- │ #1   │   398.20ms   │ 251,129 rec/s│    3.98 µs/r │   4.14x core │     77.31 MB │
- │ #2   │   399.47ms   │ 250,329 rec/s│    3.99 µs/r │   4.49x core │     77.37 MB │
- │ #3   │   422.03ms   │ 236,952 rec/s│    4.22 µs/r │   4.15x core │     77.37 MB │
- └──────┴──────────────┴──────────────┴──────────────┴──────────────┴──────────────┘
-
- 🏆 Summary:
-   • Average Elapsed Time  : 406.57 ms (100k enterprise records transformed!)
-   • Average Throughput    : 245,962 records / second
-   • Average Item Latency  : 4.066 microseconds per item
-   • Peak Working Set RSS  : 77.37 MB (Bounded memory!)
-================================================================================
-```
-
-> **Key takeaway on Micro-Batching**: For 100,000 records of 6.4 KB, streaming in micro-batches (e.g. 2,000 items per chunk) is essential to keep RAM bounded under 150 MB (measured at **77.37 MB**) instead of consuming 15 GB, reducing memory overhead by **~200x** while preserving full 245k+ rec/s throughput across all 12 cores.
-
-### Multi-Core CPU Scaling (2 Cores vs 4 Cores vs 12 Cores)
-
-Empirically measured on Windows across varying worker thread allocations:
-
-#### 1. Enterprise 100k Records (6.4 KB, Micro-Batch Streaming `chunk-size 2000`)
-| CPU Cores / Threads | Elapsed Time | Throughput | Latency / Record | CPU Scaling Factor | Peak RAM (RSS) |
-|---|---|---|---|---|---|
-| **2 Cores** | **1.14 s** | 87,508 rec/s | 11.43 $\mu\text{s}$ | 1.63x / 2.0x | **73.55 MB** |
-| **4 Cores** | **0.88 s** | 112,670 rec/s | 8.87 $\mu\text{s}$ | 2.33x / 4.0x | **74.54 MB** |
-| **12 Cores** | **0.40 s** | **245,962 rec/s** | **4.06 $\mu\text{s}$** | 4.26x / 12.0x | **77.37 MB** |
-
-#### 2. Standard 100k Records (0.3 KB, 9 Mappings In-Memory Batch)
-| CPU Cores / Threads | Elapsed Time | Throughput | Latency / Record | CPU Scaling Factor | Peak RAM (RSS) |
-|---|---|---|---|---|---|
-| **2 Cores** | **502.84 ms** | 198,869 rec/s | 5.02 $\mu\text{s}$ | 1.98x / 2.0x (99%) | 711.21 MB |
-| **4 Cores** | **342.26 ms** | 292,179 rec/s | 3.42 $\mu\text{s}$ | 3.84x / 4.0x (96%) | 711.54 MB |
-| **12 Cores** | **159.69 ms** | **626,194 rec/s** | **1.60 $\mu\text{s}$** | 10.57x / 12.0x (88%) | 715.32 MB |
-
-> **Key takeaway on Multi-Core Scaling**: On 2 cores, the engine already processes **~87k enterprise rec/s** and **~198k standard rec/s**. Scaling to 4 and 12 cores unlocks near-linear speedups without changing the memory footprint, which stays strictly flat at **~74 MB** for streaming.
-
-### 100,000 Medallion Transactions (Multi-Table Fan-Out)
-
-Benchmarking a Bronze document containing **100,000 nested transactions** fanned out into **6 Silver Relational Tables** (`silver_part`, `silver_purchase_order`, `silver_purchase_order_line`, `silver_supplier`, `silver_company_site`, `silver_supplier_location`):
-- **Fields Processed**: > 5,700,000 mapping evaluations & type casts
-- **Silver Rows Generated**: > 500,000 output objects
-- **Elapsed Time**: **3.92 seconds** (~25,516 parent items/sec / ~130,000 silver rows/sec)
-- **Parallel CPU Scaling**: 3.75x across tables & exploded rows
-
-### Run the Benchmark on Your Own Machine
+"Engine" figures time only the transform step on records that are already parsed. Synthetic data and the benchmark runner live in the separate `dto_bench` crate, not in the `dto` binary:
 
 ```bash
-# Benchmark 100,000 records
-cargo run --release --bin dto -- bench --count 100000
-
-# Benchmark custom sizes and thread counts
-cargo run --release --bin dto -- bench --count 250000 --threads 12
-
-# Benchmark Medallion Pipeline
-cargo run --release --bin dto -- bench --count 100000 --schema examples/05_medallion_pipeline/schema.json
-
-# Benchmark 100,000 enterprise 6.4 KB records with micro-batch streaming (bounded memory)
-cargo run --release --bin dto -- bench --count 100000 --payload-kb 6.4 --chunk-size 2000
+cargo run --release -p dto_bench -- engine --count 250000 --threads 6 --chunk-size 5000
+pwsh benchmarks/run_all.ps1 -Quick
 ```
 
 ---

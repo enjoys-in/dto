@@ -7,6 +7,7 @@ use rayon::prelude::*;
 use serde_json::Value;
 
 use super::compiled::CompiledObject;
+use super::memory::{estimate_heap_bytes, AutoChunker, StreamStats};
 use super::validator::{validate_output, ValidationError};
 use crate::recipe::converter::recipe_to_schema;
 use crate::recipe::model::{Constraint, Recipe};
@@ -323,6 +324,65 @@ impl DtoEngine {
         }
 
         Ok(total_processed)
+    }
+
+    /// Stream transform with **memory-capped (auto) batching**.
+    ///
+    /// Instead of a fixed record count, each record's in-memory size is
+    /// estimated as it arrives ([`estimate_heap_bytes`]) and a batch is
+    /// transformed as soon as its inputs plus their (learned) output size would
+    /// reach `max_batch_bytes`. Narrow rows give large batches, wide rows
+    /// small ones, and the memory held for records stays near the cap either
+    /// way. A single record larger than the cap is processed on its own.
+    ///
+    /// Returns statistics about the batches used. Not available for pipelines.
+    pub fn transform_stream_auto<I, F>(
+        &self,
+        items: I,
+        max_batch_bytes: usize,
+        mut on_chunk: F,
+    ) -> Result<StreamStats, TransformError>
+    where
+        I: IntoIterator<Item = Value>,
+        F: FnMut(Vec<Value>) -> Result<(), TransformError>,
+    {
+        self.object_plan()?;
+        let mut chunker = AutoChunker::new(max_batch_bytes);
+        let mut buffer = Vec::new();
+        let mut processed = 0;
+
+        for item in items {
+            let bytes = estimate_heap_bytes(&item);
+            buffer.push(item);
+            if chunker.push(bytes) {
+                processed = self.run_auto_batch(&mut buffer, processed, &mut chunker, &mut on_chunk)?;
+            }
+        }
+        if !buffer.is_empty() {
+            self.run_auto_batch(&mut buffer, processed, &mut chunker, &mut on_chunk)?;
+        }
+        Ok(chunker.stats().clone())
+    }
+
+    /// Transform one auto-sized batch, teach the chunker its output size, and
+    /// hand the outputs on. Inputs are dropped before `on_chunk` runs.
+    /// Returns the number of records processed so far.
+    pub fn run_auto_batch<F>(
+        &self,
+        buffer: &mut Vec<Value>,
+        processed: usize,
+        chunker: &mut AutoChunker,
+        on_chunk: &mut F,
+    ) -> Result<usize, TransformError>
+    where
+        F: FnMut(Vec<Value>) -> Result<(), TransformError>,
+    {
+        let outputs = self.transform_items(buffer, processed)?;
+        let count = buffer.len();
+        buffer.clear();
+        chunker.finish_batch(outputs.iter().map(estimate_heap_bytes).sum());
+        on_chunk(outputs)?;
+        Ok(processed + count)
     }
 
     fn object_plan(&self) -> Result<&CompiledObject, TransformError> {
@@ -804,5 +864,45 @@ mod tests {
     fn engine_is_send_and_sync_without_unsafe_impls() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DtoEngine>();
+    }
+
+    #[test]
+    fn auto_batching_adapts_to_row_width_and_keeps_order() {
+        let e = engine(r#"{"name":"T","mappings":[{"source":"id","target":"id"}],"required":["id"]}"#);
+        let budget = 1 << 20; // 1 MB
+        let run = |pad: usize| {
+            let items = (0..3000).map(move |i| json!({ "id": i, "pad": "x".repeat(pad) }));
+            let mut out = Vec::new();
+            let stats = e
+                .transform_stream_auto(items, budget, |chunk| {
+                    out.extend(chunk);
+                    Ok(())
+                })
+                .unwrap();
+            (stats, out)
+        };
+
+        let (narrow, out) = run(10);
+        assert_eq!(out.len(), 3000);
+        assert!(out.iter().enumerate().all(|(i, v)| v["id"] == i));
+        let (wide, _) = run(2000);
+        assert_eq!(narrow.records, 3000);
+        assert_eq!(wide.records, 3000);
+        assert!(wide.batches > narrow.batches, "wide rows need more, smaller batches");
+        assert!(wide.max_batch < narrow.max_batch);
+        // Every batch stays within the budget plus one record.
+        assert!(narrow.max_batch_bytes <= budget + 4096, "{narrow:?}");
+        assert!(wide.max_batch_bytes <= budget + 8192, "{wide:?}");
+    }
+
+    #[test]
+    fn auto_batching_reports_positions_and_rejects_pipelines() {
+        let e = engine(r#"{"name":"T","mappings":[{"source":"id","target":"id"}],"required":["id"]}"#);
+        let items = (0..5000).map(|i| if i == 4321 { json!({}) } else { json!({ "id": i }) });
+        let err = e.transform_stream_auto(items, 64 * 1024, |_| Ok(())).unwrap_err();
+        assert!(matches!(err, TransformError::Item { index: 4321, .. }), "got {err}");
+
+        let p = engine(r#"{"targets":[{"table":"t","mappings":[{"source":"k","target":"k"}]}]}"#);
+        assert!(p.transform_stream_auto(vec![json!({})], 1 << 20, |_| Ok(())).is_err());
     }
 }

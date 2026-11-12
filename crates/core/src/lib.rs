@@ -46,7 +46,7 @@ pub mod recipe;
 pub mod engine;
 
 // Re-export key types at crate root for convenience
-pub use engine::{DtoEngine, BatchResult};
+pub use engine::{estimate_heap_bytes, parse_size, AutoChunker, BatchResult, DtoEngine, StreamStats};
 pub use recipe::{Recipe, FieldMapping, Constraint};
 pub use schema::model::DtoSchema;
 pub use schema::transform::{DtoTransformer, TransformError};

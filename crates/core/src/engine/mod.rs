@@ -5,10 +5,12 @@
 //! using Rayon. Zero-copy where possible, non-blocking batch processing.
 
 mod compiled;
+mod memory;
 mod parallel;
 mod validator;
 mod unified;
 
+pub use memory::*;
 pub use parallel::*;
 pub use validator::*;
 pub use unified::*;
