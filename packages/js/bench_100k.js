@@ -1,7 +1,7 @@
 import { DTOEngine } from './src/index.js';
 
 async function run() {
-  const count = 10_000;
+  const count = 100_000;
   console.log(`================================================================================`);
   console.log(`         JAVASCRIPT / NODE.JS (WASM) 100K RECORD ARRAY BENCHMARK               `);
   console.log(`================================================================================`);

@@ -123,6 +123,42 @@ pub struct Constraint {
     pub message: Option<String>,
 }
 
+/// Constraint `type` values understood by the validator.
+pub const CONSTRAINT_TYPES: &[&str] =
+    &["string", "number", "integer", "boolean", "bool", "array", "object", "null"];
+
+impl Constraint {
+    /// Reject constraint definitions the validator would otherwise ignore silently.
+    pub fn check_definition(&self, field: &str) -> Result<(), String> {
+        if let Some(ref t) = self.value_type {
+            if !CONSTRAINT_TYPES.contains(&t.as_str()) {
+                return Err(format!(
+                    "constraint on '{field}': unknown type '{t}' (expected one of: {})",
+                    CONSTRAINT_TYPES.join(", ")
+                ));
+            }
+        }
+        if self.pattern.is_some() {
+            return Err(format!(
+                "constraint on '{field}': 'pattern' is not supported yet (it was previously ignored)"
+            ));
+        }
+        if let (Some(min), Some(max)) = (self.min, self.max) {
+            if min > max {
+                return Err(format!("constraint on '{field}': min {min} is greater than max {max}"));
+            }
+        }
+        if let (Some(min), Some(max)) = (self.min_length, self.max_length) {
+            if min > max {
+                return Err(format!(
+                    "constraint on '{field}': min_length {min} is greater than max_length {max}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Recipe {
     /// Parse a Recipe from a JSON string.
     pub fn from_json(json: &str) -> Result<Self, RecipeError> {
@@ -155,13 +191,46 @@ impl Recipe {
             }
         }
 
+        // Two mappings with the same target would silently overwrite each other.
+        if targets.len() != self.mappings.len() {
+            let mut seen = std::collections::HashSet::new();
+            if let Some(dup) = self.mappings.iter().find(|m| !seen.insert(m.target.as_str())) {
+                return Err(RecipeError::Invalid(format!(
+                    "duplicate mapping target '{}'",
+                    dup.target
+                )));
+            }
+        }
+
         // Check that constraint keys reference existing mapping targets.
-        for key in self.constraints.keys() {
+        for (key, constraint) in &self.constraints {
             if !targets.contains(key.as_str()) {
                 return Err(RecipeError::Invalid(format!(
                     "constraint key '{}' does not match any mapping target",
                     key
                 )));
+            }
+            constraint.check_definition(key).map_err(RecipeError::Invalid)?;
+        }
+
+        // Nested recipes must be valid themselves and must produce an object.
+        for mapping in &self.mappings {
+            if let Some(ref nested) = mapping.nested {
+                if let Some(ref t) = mapping.field_type {
+                    if t != "object" {
+                        return Err(RecipeError::Invalid(format!(
+                            "mapping '{}' has a nested recipe but type '{t}'; nested recipes produce an object",
+                            mapping.target
+                        )));
+                    }
+                }
+                nested.validate()?;
+                if !nested.constraints.is_empty() {
+                    return Err(RecipeError::Invalid(format!(
+                        "mapping '{}': constraints are only supported on the top-level recipe",
+                        mapping.target
+                    )));
+                }
             }
         }
 

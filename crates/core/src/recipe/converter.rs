@@ -35,10 +35,15 @@ fn mapping_to_field_schema(mapping: &FieldMapping) -> Result<FieldSchema, Recipe
         parse_source_and_transforms(&mapping.source)
     };
 
-    let field_type = mapping
-        .field_type
-        .clone()
-        .unwrap_or_else(|| infer_type_from_source(&clean_source));
+    let field_type = mapping.field_type.clone().unwrap_or_else(|| {
+        if mapping.nested.is_some() {
+            // A nested recipe always produces an object; without this the
+            // nested mappings were silently ignored unless `"type": "object"` was set.
+            "object".to_string()
+        } else {
+            infer_type_from_source(&clean_source)
+        }
+    });
 
     let from = if mapping.literal {
         None // Literal values don't use path resolution

@@ -106,8 +106,18 @@ You can chain multiple transformations using either **pipe (`|`)**, **comma (`,`
 
 #### Available Built-in Functions & Casts:
 - **String**: `trim`, `lowercase` (or `lower`), `uppercase` (or `upper`), `reverse`
-- **Numeric & Casting**: `to_string` (`string`), `to_number` (`number`, `decimal`, `float`, `int`), `to_bool` (`boolean`), `date` (`YYYY-MM-DD`), `timestamp`, `json`
+- **Numeric & Casting**: `to_string` (`string`), `to_number` (`number`, `decimal`, `float`, `int`, `integer`), `to_bool` (`bool`, `boolean`), `date`, `timestamp`, `json`
 - **Collection / Array**: `first`, `last`, `length`, `keys`, `values`, `flatten`, `unique`, `sort`, `compact`
+
+**Date & time casts.** `date` and `timestamp` accept an ISO-8601 date (`2024-03-15`) or date-time (`T` or space separator, optional seconds, fraction and `Z`/`±HH:MM` offset), or a Unix epoch number (seconds; milliseconds when ≥ 1e11).
+- `date` → `YYYY-MM-DD`. The calendar date is taken as written; no time-zone conversion.
+- `timestamp` → `YYYY-MM-DDTHH:MM:SS[.fraction][offset]`. A date-only value becomes midnight, an offset is kept as written, and epoch numbers are rendered in UTC with `Z`.
+- Anything else (`"not a date"`, `2024-02-30`, `15/03/2024`) is an error. It is never truncated.
+
+### Error Handling
+- **Configuration errors fail when the engine is created**: unknown functions, invalid paths, `required` fields with no mapping, duplicate targets, unknown constraint types, unknown pipeline `grain` / `dedup_strategy` / `unpack` values.
+- **Array input fails as a whole** if any record fails (missing required field, failed cast, constraint violation, non-object element). The error names the record's position in the input, e.g. `item 1: required field 'id' is missing`. To keep the good records and collect the bad ones, use `DtoEngine::transform_batch` (Rust). Its `BatchResult` has `items`, their original `indices`, `errors` and `validation_errors`.
+- **Constraints**: `type` (`string`, `number`, `integer`, `boolean`, `array`, `object`, `null`), `min`/`max`, `min_length`/`max_length` (counted in characters), `allowed`, and an optional `message` that replaces the default error text. `pattern` is not supported yet and is rejected rather than ignored.
 
 ---
 
@@ -153,8 +163,11 @@ For enterprise data ingestion, the engine natively executes multi-target relatio
 ### Medallion Engine Capabilities:
 1. **Multi-Table Fan-Out**: Automatically routes one incoming Bronze document into multiple distinct Silver tables.
 2. **`unpack: "array_explode"`**: Unrolls nested arrays into individual rows while automatically **broadcasting parent fields** (e.g. `item_id`) down to each line item.
-3. **Deduplication (`dedup_strategy: "latest"`)**: Groups records by their `business_key` and retains only the latest record.
-4. **Column Categorization**: Supports `kind: "column"` and `kind: "extension"`.
+3. **Deduplication (`dedup_strategy: "latest"`)**: Groups rows by their `business_key` and keeps one row per key. Set `sequence_by` (alias `order_by`) to an output column to keep the row with the greatest value. Numbers compare numerically and strings lexicographically, so ISO-8601 timestamps sort correctly when they share one offset; ties go to the later row. Without `sequence_by`, the **last row in input order** wins. Rows whose key column is missing or null are never merged. `business_key` and `sequence_by` must name columns that a mapping produces.
+4. **Grain**: `grain: "header"` produces one row per document, even when a mapping such as `roles[*].name` yields an array column. `grain: "line"`, or any `unpack: "array_explode"` mapping, produces one row per element of the exploded array. Inline pipes (`transactions[*].qty | to_number`) work on exploded fields.
+5. **Column Categorization**: Supports `kind: "column"` and `kind: "extension"`.
+
+> Not implemented yet: `sources[].filters`, `targets[].source_id` and `targets[].contract` are accepted, but nothing is enforced.
 
 ---
 
@@ -283,6 +296,11 @@ cargo run --bin dto -- transform -s recipe.json -i data.json --pretty
 # Or pipe through stdin
 cat data.json | cargo run --bin dto -- transform -s recipe.json
 
+# Stream a large top-level array with bounded memory (~23 MB peak for a 95 MB / 300k-record file).
+# The input is parsed incrementally; only one chunk of records is held at a time.
+# Not available for pipelines (deduplication needs the whole input).
+cargo run --release --bin dto -- transform -s recipe.json -i big.json --chunk-size 2000
+
 # Validate syntax and structure of a recipe/schema
 cargo run --bin dto -- validate -s recipe.json
 
@@ -295,6 +313,10 @@ cargo run --bin dto -- functions
 ## 5. Performance Benchmarks (100k+ Records, Multi-Threaded Rayon)
 
 Benchmarked on **Windows (12 Logical CPU Cores, 12 Rayon Worker Threads)** using high-resolution hardware timers, `GetProcessMemoryInfo` for Working Set (RSS) RAM tracking, and `GetProcessTimes` for multi-core CPU utilization.
+
+> **What these numbers measure:** `dto bench` times only the in-memory transform step. The input is already a parsed `serde_json::Value` and the output is not serialized. End-to-end runs that read, parse and write JSON are slower. On the same 12-thread machine, `dto transform` on a 95 MB / 300k-record file took ~2.9 s (~100k records/s), or ~4.2 s with `--chunk-size 2000`. The SDKs run the single-threaded WASM build and copy JSON text across the boundary on every call.
+>
+> The tables below were recorded before paths and transform chains were compiled once per batch. With that change, the same `dto bench` runs measure ~1.49M records/s for the default recipe on 12 threads (~273k on 1 thread) and ~413k records/s for the 6.4 KB enterprise records with `--chunk-size 2000`.
 
 ### 100,000-Record Array Transformation
 

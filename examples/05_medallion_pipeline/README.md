@@ -28,10 +28,11 @@ This example demonstrates an **Enterprise Medallion Architecture pipeline** conv
    Unrolls nested transactions (`transactions[*]`) into individual relational rows while automatically **broadcasting parent document fields** (e.g. `item_id`, `revision_number`, `reference.category`) down into each exploded row.
 
 4. **Deduplication Strategy (`dedup_strategy: "latest"`)**:
-   Automatically groups by `business_key` (such as `["supplier_id"]` or `["site_id"]`) and keeps the latest record, eliminating duplicate entries across transactions.
+   Groups rows by `business_key` (such as `["supplier_id"]` or `["site_id"]`) and keeps one row per key. Without `sequence_by`, the last row in input order wins. Add `"sequence_by": "<column>"` to keep the row with the greatest value in that column instead, e.g. an ISO-8601 timestamp.
 
 5. **Type Casting (`cast`)**:
-   - `cast: "date"`: Formats ISO-8601 timestamps to `YYYY-MM-DD` (`2026-11-12`).
+   - `cast: "date"`: Converts ISO-8601 dates/date-times (or Unix epoch numbers) to `YYYY-MM-DD` (`2026-11-12`). Invalid dates are an error.
+   - `cast: "timestamp"`: Normalizes to `YYYY-MM-DDTHH:MM:SS[.fraction][offset]`, keeping the offset as written.
    - `cast: "decimal"`: Casts values to floating-point numbers.
    - `cast: "boolean"`: Normalizes boolean flags.
    - `cast: "json"`: Preserves full nested objects for extension columns (e.g., `flex_attributes`).

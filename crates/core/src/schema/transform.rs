@@ -55,13 +55,55 @@ pub enum TransformError {
     },
 
     /// Output failed validation constraints.
-    #[error("validation error on item {index}: {errors:?}")]
+    #[error("validation error on item {index}: {}", .errors.join("; "))]
     Validation {
         /// Index of the item that failed.
         index: usize,
         /// List of validation error messages.
         errors: Vec<String>,
     },
+
+    /// One element of an array input failed. `index` is its position in the
+    /// original input array.
+    #[error("item {index}: {source}")]
+    Item {
+        /// Position of the failing element in the input array.
+        index: usize,
+        /// The underlying error.
+        #[source]
+        source: Box<TransformError>,
+    },
+
+    /// An input record was not a JSON object.
+    #[error("expected a JSON object, got {0}")]
+    NotAnObject(&'static str),
+
+    /// A multi-target pipeline failed while processing data.
+    #[error("pipeline error: {0}")]
+    Pipeline(String),
+}
+
+impl TransformError {
+    /// Attach the position of the failing element of an array input.
+    pub fn at_item(self, index: usize) -> Self {
+        match self {
+            // Validation errors already carry their index.
+            TransformError::Validation { .. } | TransformError::Item { .. } => self,
+            other => TransformError::Item { index, source: Box::new(other) },
+        }
+    }
+}
+
+/// JSON type name of a value, used in error messages.
+pub(crate) fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 impl From<SchemaError> for TransformError {

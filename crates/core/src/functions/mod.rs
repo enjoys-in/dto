@@ -21,6 +21,48 @@ pub enum FunctionError {
         /// Human-readable description of the value type that was passed.
         value_type: String,
     },
+
+    /// The value has the right type but its content could not be parsed
+    /// (e.g. `"not a date"` passed to `date`).
+    #[error("function '{function}' cannot parse {value}: expected {expected}")]
+    InvalidValue {
+        /// Name of the function that was called.
+        function: String,
+        /// The offending value (truncated for display).
+        value: String,
+        /// Description of the accepted formats.
+        expected: String,
+    },
+}
+
+/// Signature shared by every built-in transform function.
+pub type TransformFn = fn(Value) -> Result<Value, FunctionError>;
+
+/// Look up a built-in transform function (or one of its aliases) by name.
+pub fn lookup(name: &str) -> Option<TransformFn> {
+    let f: TransformFn = match name {
+        "trim" => fn_trim,
+        "lowercase" | "lower" => fn_lowercase,
+        "uppercase" | "upper" => fn_uppercase,
+        "to_string" | "string" => fn_to_string,
+        "to_number" | "number" | "decimal" | "float" | "int" | "integer" => fn_to_number,
+        "to_bool" | "bool" | "boolean" => fn_to_bool,
+        "json" => fn_identity,
+        "date" => fn_to_date,
+        "timestamp" => fn_to_timestamp,
+        "flatten" => fn_flatten,
+        "length" | "len" => fn_length,
+        "keys" => fn_keys,
+        "values" => fn_values,
+        "first" => fn_first,
+        "last" => fn_last,
+        "reverse" => fn_reverse,
+        "unique" | "uniq" => fn_unique,
+        "sort" => fn_sort,
+        "compact" => fn_compact,
+        _ => return None,
+    };
+    Some(f)
 }
 
 /// Apply a named transform function to a JSON value.
@@ -38,28 +80,28 @@ pub enum FunctionError {
 /// assert_eq!(result, json!("hello"));
 /// ```
 pub fn apply_transform(name: &str, value: Value) -> Result<Value, FunctionError> {
-    match name {
-        "trim" => fn_trim(value),
-        "lowercase" | "lower" => fn_lowercase(value),
-        "uppercase" | "upper" => fn_uppercase(value),
-        "to_string" | "string" => fn_to_string(value),
-        "to_number" | "number" | "decimal" | "float" | "int" | "integer" => fn_to_number(value),
-        "to_bool" | "bool" | "boolean" => fn_to_bool(value),
-        "json" => Ok(value),
-        "date" => fn_to_date(value),
-        "timestamp" => fn_to_timestamp(value),
-        "flatten" => fn_flatten(value),
-        "length" | "len" => fn_length(value),
-        "keys" => fn_keys(value),
-        "values" => fn_values(value),
-        "first" => fn_first(value),
-        "last" => fn_last(value),
-        "reverse" => fn_reverse(value),
-        "unique" | "uniq" => fn_unique(value),
-        "sort" => fn_sort(value),
-        "compact" => fn_compact(value),
-        _ => Err(FunctionError::UnknownFunction(name.to_string())),
+    let f = lookup(name).ok_or_else(|| FunctionError::UnknownFunction(name.to_string()))?;
+    f(value)
+}
+
+/// Parse a chain such as `"trim | lowercase"` into function pointers once, so it
+/// can be applied to many values without re-parsing. Unknown names are an error.
+pub fn compile_chain(chain: &str) -> Result<Vec<TransformFn>, FunctionError> {
+    chain
+        .replace("->", "|")
+        .split(['|', ','])
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| lookup(name).ok_or_else(|| FunctionError::UnknownFunction(name.to_string())))
+        .collect()
+}
+
+/// Apply a chain produced by [`compile_chain`], left to right.
+pub fn apply_compiled_chain(chain: &[TransformFn], mut value: Value) -> Result<Value, FunctionError> {
+    for f in chain {
+        value = f(value)?;
     }
+    Ok(value)
 }
 
 /// Apply a chain of transform functions separated by `|`, `,`, or `->`.
@@ -79,15 +121,8 @@ pub fn apply_transform(name: &str, value: Value) -> Result<Value, FunctionError>
 /// let num_as_str = apply_transform_chain("to_string | trim", json!(12345)).unwrap();
 /// assert_eq!(num_as_str, json!("12345"));
 /// ```
-pub fn apply_transform_chain(chain: &str, mut value: Value) -> Result<Value, FunctionError> {
-    let normalized = chain.replace("->", "|");
-    for func in normalized.split(|c| c == '|' || c == ',') {
-        let func = func.trim();
-        if !func.is_empty() {
-            value = apply_transform(func, value)?;
-        }
-    }
-    Ok(value)
+pub fn apply_transform_chain(chain: &str, value: Value) -> Result<Value, FunctionError> {
+    apply_compiled_chain(&compile_chain(chain)?, value)
 }
 
 /// Returns a list of all available transform function names (including aliases).
@@ -102,8 +137,16 @@ pub fn available_functions() -> Vec<&'static str> {
         "string",
         "to_number",
         "number",
+        "decimal",
+        "float",
+        "int",
+        "integer",
         "to_bool",
         "bool",
+        "boolean",
+        "json",
+        "date",
+        "timestamp",
         "flatten",
         "length",
         "len",
@@ -245,29 +288,256 @@ fn fn_to_bool(value: Value) -> Result<Value, FunctionError> {
     }
 }
 
-/// Format or normalize a value to a date string (YYYY-MM-DD).
-fn fn_to_date(value: Value) -> Result<Value, FunctionError> {
-    match value {
-        Value::String(s) => {
-            let trimmed = s.trim();
-            if let Some(idx) = trimmed.find(|c| c == 'T' || c == ' ') {
-                Ok(Value::String(trimmed[..idx].to_string()))
-            } else {
-                Ok(Value::String(trimmed.to_string()))
-            }
-        }
-        Value::Number(n) => Ok(Value::String(n.to_string())),
-        other => Err(invalid("date", &other)),
+/// `json` cast: pass the value through unchanged.
+fn fn_identity(value: Value) -> Result<Value, FunctionError> {
+    Ok(value)
+}
+
+const DATE_FORMATS: &str =
+    "an ISO-8601 date (YYYY-MM-DD), an ISO-8601 date-time, or Unix epoch seconds/milliseconds";
+
+/// Build an [`FunctionError::InvalidValue`] for an unparsable date/time value.
+fn unparsable(function: &str, value: &Value) -> FunctionError {
+    let mut shown = value.to_string();
+    if shown.chars().count() > 60 {
+        shown = shown.chars().take(57).collect::<String>() + "...";
+    }
+    FunctionError::InvalidValue {
+        function: function.to_string(),
+        value: shown,
+        expected: DATE_FORMATS.to_string(),
     }
 }
 
-/// Normalize a value to a timestamp string.
-fn fn_to_timestamp(value: Value) -> Result<Value, FunctionError> {
-    match value {
-        Value::String(s) => Ok(Value::String(s.trim().to_string())),
-        Value::Number(n) => Ok(Value::String(n.to_string())),
-        other => Err(invalid("timestamp", &other)),
+/// Convert a value to a calendar date string (`YYYY-MM-DD`).
+///
+/// - Strings must be an ISO-8601 date or date-time (`T` or space separator,
+///   optional seconds, fraction and `Z`/`±HH:MM` offset). The calendar date is
+///   taken as written; no time-zone conversion is applied.
+/// - Numbers are Unix epoch time in UTC: seconds, or milliseconds when the
+///   magnitude is ≥ 1e11 (i.e. any date after 1973-03-03 given in ms).
+/// - Anything else (including invalid dates like `2024-02-30`) is an error.
+fn fn_to_date(value: Value) -> Result<Value, FunctionError> {
+    match &value {
+        Value::String(s) => match parse_iso_datetime(s.trim()) {
+            Some(dt) => Ok(Value::String(format!("{:04}-{:02}-{:02}", dt.year, dt.month, dt.day))),
+            None => Err(unparsable("date", &value)),
+        },
+        Value::Number(n) => match epoch_millis(n) {
+            Some(ms) => {
+                let (y, m, d) = civil_from_days(ms.div_euclid(MS_PER_DAY));
+                Ok(Value::String(format!("{y:04}-{m:02}-{d:02}")))
+            }
+            None => Err(unparsable("date", &value)),
+        },
+        _ => Err(invalid("date", &value)),
     }
+}
+
+/// Convert a value to a normalized ISO-8601 timestamp
+/// (`YYYY-MM-DDTHH:MM:SS[.fraction][Z|±HH:MM]`).
+///
+/// - Strings use the same grammar as [`fn_to_date`]. A date-only string becomes
+///   midnight; a missing offset stays missing (no time zone is assumed); an
+///   offset is kept as written (normalized to `±HH:MM`).
+/// - Numbers are Unix epoch time (seconds, or ms when ≥ 1e11) rendered in UTC with `Z`.
+fn fn_to_timestamp(value: Value) -> Result<Value, FunctionError> {
+    match &value {
+        Value::String(s) => match parse_iso_datetime(s.trim()) {
+            Some(dt) => {
+                let (h, mi, sec, frac) = dt.time.unwrap_or((0, 0, 0, String::new()));
+                let mut out = format!(
+                    "{:04}-{:02}-{:02}T{h:02}:{mi:02}:{sec:02}",
+                    dt.year, dt.month, dt.day
+                );
+                if !frac.is_empty() {
+                    out.push('.');
+                    out.push_str(&frac);
+                }
+                if let Some(offset) = dt.offset {
+                    out.push_str(&offset);
+                }
+                Ok(Value::String(out))
+            }
+            None => Err(unparsable("timestamp", &value)),
+        },
+        Value::Number(n) => match epoch_millis(n) {
+            Some(ms) => {
+                let (y, m, d) = civil_from_days(ms.div_euclid(MS_PER_DAY));
+                let ms_of_day = ms.rem_euclid(MS_PER_DAY);
+                let (h, mi, sec, milli) = (
+                    ms_of_day / 3_600_000,
+                    ms_of_day / 60_000 % 60,
+                    ms_of_day / 1000 % 60,
+                    ms_of_day % 1000,
+                );
+                let mut out = format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{sec:02}");
+                if milli != 0 {
+                    out.push_str(&format!(".{milli:03}"));
+                }
+                out.push('Z');
+                Ok(Value::String(out))
+            }
+            None => Err(unparsable("timestamp", &value)),
+        },
+        _ => Err(invalid("timestamp", &value)),
+    }
+}
+
+// ─── Date/time parsing helpers (no external dependencies) ──────────────────
+
+const MS_PER_DAY: i64 = 86_400_000;
+/// 0000-01-01T00:00:00Z and 9999-12-31T23:59:59.999Z in epoch milliseconds.
+const MIN_EPOCH_MS: i64 = -62_167_219_200_000;
+const MAX_EPOCH_MS: i64 = 253_402_300_799_999;
+
+/// Pieces of a parsed ISO-8601 date / date-time.
+struct DateTimeParts {
+    year: i64,
+    month: u32,
+    day: u32,
+    /// (hour, minute, second, fractional-second digits)
+    time: Option<(u32, u32, u32, String)>,
+    /// `"Z"` or `"±HH:MM"`.
+    offset: Option<String>,
+}
+
+/// Parse `YYYY-MM-DD[(T|t| )HH:MM[:SS[(.|,)fraction]][Z|z|±HH[:]MM|±HH]]`,
+/// validating every calendar and clock field.
+fn parse_iso_datetime(s: &str) -> Option<DateTimeParts> {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+
+    let digits = |i: &mut usize, n: usize| -> Option<u32> {
+        let chunk = b.get(*i..*i + n)?;
+        if !chunk.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        *i += n;
+        Some(chunk.iter().fold(0u32, |acc, d| acc * 10 + u32::from(d - b'0')))
+    };
+    let expect = |i: &mut usize, c: u8| -> Option<()> {
+        (b.get(*i) == Some(&c)).then(|| *i += 1)
+    };
+
+    let year = i64::from(digits(&mut i, 4)?);
+    expect(&mut i, b'-')?;
+    let month = digits(&mut i, 2)?;
+    expect(&mut i, b'-')?;
+    let day = digits(&mut i, 2)?;
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return None;
+    }
+    if i == b.len() {
+        return Some(DateTimeParts { year, month, day, time: None, offset: None });
+    }
+
+    if !matches!(b[i], b'T' | b't' | b' ') {
+        return None;
+    }
+    i += 1;
+    let hour = digits(&mut i, 2)?;
+    expect(&mut i, b':')?;
+    let minute = digits(&mut i, 2)?;
+    let mut second = 0;
+    let mut fraction = String::new();
+    if b.get(i) == Some(&b':') {
+        i += 1;
+        second = digits(&mut i, 2)?;
+        if matches!(b.get(i), Some(b'.') | Some(b',')) {
+            i += 1;
+            let start = i;
+            while b.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+            fraction = s[start..i].to_string();
+        }
+    }
+    // Allow a leap second (60); reject everything else out of range.
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let offset = match b.get(i) {
+        None => None,
+        Some(b'Z') | Some(b'z') => {
+            i += 1;
+            Some("Z".to_string())
+        }
+        Some(&sign @ (b'+' | b'-')) => {
+            i += 1;
+            let oh = digits(&mut i, 2)?;
+            let om = if i == b.len() {
+                0
+            } else {
+                if b[i] == b':' {
+                    i += 1;
+                }
+                digits(&mut i, 2)?
+            };
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            Some(format!("{}{oh:02}:{om:02}", sign as char))
+        }
+        Some(_) => return None,
+    };
+    if i != b.len() {
+        return None;
+    }
+
+    Some(DateTimeParts {
+        year,
+        month,
+        day,
+        time: Some((hour, minute, second, fraction)),
+        offset,
+    })
+}
+
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Interpret a JSON number as Unix epoch milliseconds (seconds when |n| < 1e11).
+fn epoch_millis(n: &serde_json::Number) -> Option<i64> {
+    let f = n.as_f64()?;
+    if !f.is_finite() {
+        return None;
+    }
+    let ms = (if f.abs() >= 1e11 { f } else { f * 1000.0 }).round();
+    if ms < MIN_EPOCH_MS as f64 || ms > MAX_EPOCH_MS as f64 {
+        return None;
+    }
+    Some(ms as i64)
+}
+
+/// Days since 1970-01-01 → (year, month, day) in the proleptic Gregorian calendar.
+/// (Howard Hinnant's `civil_from_days` algorithm.)
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
 }
 
 /// Flatten one level of nested arrays. Non-array values are returned as-is.
@@ -1026,5 +1296,76 @@ mod tests {
     fn chain_with_arrow_syntax() {
         let result = apply_transform_chain("trim -> lowercase", json!("  HELLO  ")).unwrap();
         assert_eq!(result, json!("hello"));
+    }
+
+    // ── date / timestamp ────────────────────────────────────────────────
+
+    #[test]
+    fn date_accepts_iso_dates_and_datetimes() {
+        assert_eq!(apply_transform("date", json!("2024-03-15")).unwrap(), json!("2024-03-15"));
+        assert_eq!(apply_transform("date", json!(" 2024-03-15T10:20:30Z ")).unwrap(), json!("2024-03-15"));
+        assert_eq!(apply_transform("date", json!("2026-11-12T14:30:00+05:30")).unwrap(), json!("2026-11-12"));
+        assert_eq!(apply_transform("date", json!("2024-03-15 10:20")).unwrap(), json!("2024-03-15"));
+        assert_eq!(apply_transform("date", json!("2024-02-29")).unwrap(), json!("2024-02-29"));
+    }
+
+    #[test]
+    fn date_rejects_garbage_instead_of_truncating() {
+        for bad in [
+            "not a date", "Thursday", "15/03/2024", "2024-02-30", "2023-02-29",
+            "2024-13-01", "2024-03-15Tgarbage", "2024-03-15T25:00", "", "2024-3-5",
+        ] {
+            let err = apply_transform("date", json!(bad)).unwrap_err();
+            assert!(
+                matches!(err, FunctionError::InvalidValue { .. }),
+                "{bad:?} should be rejected, got {err}"
+            );
+        }
+        assert!(apply_transform("date", json!(true)).is_err());
+    }
+
+    #[test]
+    fn date_from_epoch_seconds_and_millis() {
+        assert_eq!(apply_transform("date", json!(0)).unwrap(), json!("1970-01-01"));
+        assert_eq!(apply_transform("date", json!(1710497430)).unwrap(), json!("2024-03-15"));
+        assert_eq!(apply_transform("date", json!(1710497430000_i64)).unwrap(), json!("2024-03-15"));
+        assert_eq!(apply_transform("date", json!(-86400)).unwrap(), json!("1969-12-31"));
+        assert_eq!(apply_transform("date", json!(951782400)).unwrap(), json!("2000-02-29"));
+        assert!(apply_transform("date", json!(1e20)).is_err());
+    }
+
+    #[test]
+    fn timestamp_normalizes_and_validates() {
+        let ts = |v: Value| apply_transform("timestamp", v);
+        assert_eq!(ts(json!("2026-11-12T14:30:00+05:30")).unwrap(), json!("2026-11-12T14:30:00+05:30"));
+        assert_eq!(ts(json!("2024-03-15 10:20:30")).unwrap(), json!("2024-03-15T10:20:30"));
+        assert_eq!(ts(json!("2024-03-15t10:20z")).unwrap(), json!("2024-03-15T10:20:00Z"));
+        assert_eq!(
+            ts(json!("2024-03-15T10:20:30.123456-0400")).unwrap(),
+            json!("2024-03-15T10:20:30.123456-04:00")
+        );
+        assert_eq!(ts(json!("2024-03-15T10:20:30+01")).unwrap(), json!("2024-03-15T10:20:30+01:00"));
+        assert_eq!(ts(json!("2024-03-15")).unwrap(), json!("2024-03-15T00:00:00"));
+        assert_eq!(ts(json!(1710497430)).unwrap(), json!("2024-03-15T10:10:30Z"));
+        assert_eq!(ts(json!(1710497430123_i64)).unwrap(), json!("2024-03-15T10:10:30.123Z"));
+        for bad in ["yesterday", "2024-03-15T10", "2024-03-15T10:20:30+25:00", "2024-03-15T10:20:30.", "10:20:30"] {
+            assert!(ts(json!(bad)).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn compile_chain_rejects_unknown_names_up_front() {
+        let err = compile_chain("trim | uppercsae").unwrap_err();
+        assert!(err.to_string().contains("uppercsae"));
+        let chain = compile_chain("trim -> lowercase, uppercase").unwrap();
+        assert_eq!(chain.len(), 3);
+        assert_eq!(apply_compiled_chain(&chain, json!("  Ab ")).unwrap(), json!("AB"));
+    }
+
+    #[test]
+    fn every_listed_function_resolves() {
+        for name in available_functions() {
+            assert!(lookup(name).is_some(), "available_functions lists '{name}' but lookup fails");
+        }
     }
 }

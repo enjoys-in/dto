@@ -4,17 +4,30 @@
 //! - Multi-table projection (fan-out from 1 source to multiple target silver tables)
 //! - `unpack: "array_explode"` (unrolling array items with parent field broadcasting)
 //! - `grain: "header"` vs `grain: "line"`
-//! - Deduplication by `business_key` with `dedup_strategy: "latest"`
+//! - Deduplication by `business_key` with `dedup_strategy: "latest"` (optionally
+//!   ordered by a `sequence_by` column)
 //! - Type casts (`decimal`, `date`, `timestamp`, `string`, `json`, `boolean`)
+//!
+//! A [`PipelineSpec`] is compiled into a [`CompiledPipeline`] once; configuration
+//! mistakes (unknown grain / strategy / function, bad paths, duplicate tables,
+//! dedup keys that no mapping produces) are reported at that point.
 
+use std::cmp::Ordering;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
+use super::converter::parse_source_and_transforms;
 use super::model::{FieldMapping, RecipeError};
-use crate::functions;
-use crate::path::{tokenizer, resolver};
+use crate::functions::{self, TransformFn};
+use crate::path::{ast::DtoPath, resolver, tokenizer};
+use crate::schema::transform::json_type_name;
+
+/// Arrays with at least this many elements are exploded in parallel.
+const PARALLEL_EXPLODE_MIN: usize = 256;
 
 /// Full multi-target pipeline specification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +63,13 @@ pub struct TargetSpec {
     pub business_key: Vec<String>,
     #[serde(default)]
     pub dedup_strategy: Option<String>,
+    /// Output column that orders duplicates for `dedup_strategy: "latest"`: the
+    /// row with the greatest value wins (numbers numerically, strings
+    /// lexicographically — ISO-8601 timestamps in one offset sort correctly;
+    /// missing/null sort lowest; ties go to the later row). Without it, the last
+    /// row in input order wins.
+    #[serde(default, alias = "order_by")]
+    pub sequence_by: Option<String>,
     pub mappings: Vec<FieldMapping>,
     #[serde(default)]
     pub contract: Option<ContractSpec>,
@@ -64,16 +84,6 @@ pub struct ContractSpec {
     pub nullable: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-struct PrecompiledExplodeMapping {
-    target: String,
-    transform: Option<String>,
-    default: Option<Value>,
-    is_exploded_field: bool,
-    is_whole_element: bool,
-    parsed_path: Option<crate::path::ast::DtoPath>,
-}
-
 impl PipelineSpec {
     /// Parse a pipeline specification from a JSON string.
     pub fn from_json(json: &str) -> Result<Self, RecipeError> {
@@ -85,298 +95,440 @@ impl PipelineSpec {
         serde_json::from_value(value).map_err(RecipeError::Parse)
     }
 
+    /// Validate the specification and compile it for execution.
+    pub fn compile(&self) -> Result<CompiledPipeline, String> {
+        if self.targets.is_empty() {
+            return Err("pipeline must define at least one target".into());
+        }
+        let mut tables = HashSet::new();
+        for target in &self.targets {
+            if !tables.insert(target.table.as_str()) {
+                return Err(format!(
+                    "duplicate target table '{}': each table may appear only once",
+                    target.table
+                ));
+            }
+        }
+        let targets = self
+            .targets
+            .iter()
+            .map(compile_target)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CompiledPipeline { targets })
+    }
+
     /// Execute the entire pipeline on input data (single object or array of objects).
     /// Returns a map of `table_name -> array of transformed rows`.
     pub fn execute(&self, input: &Value) -> Result<HashMap<String, Vec<Value>>, String> {
-        // Process each document (either single object or items in an array)
-        let items: Vec<&Value> = match input {
-            Value::Array(arr) => arr.iter().collect(),
-            Value::Object(_) => vec![input],
-            _ => return Err("pipeline input must be a JSON object or array of objects".to_string()),
-        };
+        self.compile()?.execute(input)
+    }
+}
 
-        // Process all target tables in parallel using Rayon
-        let target_outputs: Result<Vec<(String, Vec<Value>)>, String> = self
+/// A validated, ready-to-run pipeline.
+#[derive(Debug, Clone)]
+pub struct CompiledPipeline {
+    targets: Vec<CompiledTarget>,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledTarget {
+    table: String,
+    grain: Grain,
+    mappings: Vec<PipeMapping>,
+    dedup: Option<Dedup>,
+}
+
+#[derive(Debug, Clone)]
+enum Grain {
+    /// One row per input document.
+    Header,
+    /// One row per element of the array at `array`.
+    Line { array: DtoPath, array_name: String },
+}
+
+#[derive(Debug, Clone)]
+struct PipeMapping {
+    target: String,
+    source: PipeSource,
+    chain: Vec<TransformFn>,
+    default: Option<Value>,
+}
+
+/// Where a mapping's raw value comes from.
+#[derive(Debug, Clone)]
+enum PipeSource {
+    Literal(Value),
+    /// Path resolved against the whole input document (broadcast to every line row).
+    Document(DtoPath),
+    /// Path resolved against the current exploded element (`None` = the whole element).
+    Element(Option<DtoPath>),
+}
+
+#[derive(Debug, Clone)]
+struct Dedup {
+    business_key: Vec<String>,
+    sequence_by: Option<String>,
+}
+
+impl CompiledPipeline {
+    /// Execute on a single object or an array of objects.
+    pub fn execute(&self, input: &Value) -> Result<HashMap<String, Vec<Value>>, String> {
+        match input {
+            Value::Array(items) => self.execute_items(items, true),
+            Value::Object(_) => self.execute_items(std::slice::from_ref(input), false),
+            other => Err(format!(
+                "pipeline input must be a JSON object or array of objects, got {}",
+                json_type_name(other)
+            )),
+        }
+    }
+
+    /// Execute on a slice of documents. `is_batch` controls whether error
+    /// messages include the failing document's index.
+    pub fn execute_items(
+        &self,
+        items: &[Value],
+        is_batch: bool,
+    ) -> Result<HashMap<String, Vec<Value>>, String> {
+        let outputs: Vec<Result<Vec<Value>, String>> = self
             .targets
             .par_iter()
-            .map(|target| {
-                let mut table_rows = Vec::new();
-                for item in &items {
-                    let rows = self.execute_target_on_item(target, item)?;
-                    table_rows.extend(rows);
-                }
-
-                // Deduplicate if requested
-                if let Some(ref strategy) = target.dedup_strategy {
-                    if strategy == "latest" && !target.business_key.is_empty() {
-                        table_rows = deduplicate_latest(table_rows, &target.business_key);
-                    }
-                }
-
-                Ok((target.table.clone(), table_rows))
-            })
+            .map(|target| target.execute(items, is_batch))
             .collect();
 
         let mut results = HashMap::with_capacity(self.targets.len());
-        for (table, rows) in target_outputs? {
-            results.insert(table, rows);
+        for (target, rows) in self.targets.iter().zip(outputs) {
+            results.insert(target.table.clone(), rows?);
         }
-
         Ok(results)
     }
+}
 
-    fn execute_target_on_item(&self, target: &TargetSpec, item: &Value) -> Result<Vec<Value>, String> {
-        // Detect if any mapping requests array explode or if grain is line
-        let has_explode = target.mappings.iter().any(|m| {
-            m.unpack.as_deref() == Some("array_explode") || m.source.contains("[*]")
-        });
-
-        let is_line_grain = target.grain.as_deref() == Some("line") || has_explode;
-
-        if !is_line_grain {
-            // Header grain: exactly 1 row from this input item
-            let row = self.transform_single_row(&target.mappings, item, item)?;
-            Ok(vec![Value::Object(row)])
-        } else {
-            // Line grain: find the array to explode
-            let explode_path = self.find_explode_path(target);
-            if let Some(ref path_prefix) = explode_path {
-                let array_path = tokenizer::parse(path_prefix).map_err(|e| e.to_string())?;
-                let resolved_array = resolver::resolve(item, &array_path);
-
-                match resolved_array {
-                    Some(Value::Array(elements)) => {
-                        let explode_pattern = format!("{}[*]", path_prefix);
-                        let explode_prefix_dot = format!("{}[*].", path_prefix);
-
-                        let precompiled: Vec<PrecompiledExplodeMapping> = target
-                            .mappings
-                            .iter()
-                            .map(|m| {
-                                let is_exploded_field = m.unpack.as_deref() == Some("array_explode")
-                                    || m.source.starts_with(&explode_pattern);
-                                let (is_whole, path_str) = if is_exploded_field {
-                                    if m.source == explode_pattern {
-                                        (true, None)
-                                    } else if m.source.starts_with(&explode_prefix_dot) {
-                                        (false, Some(&m.source[explode_prefix_dot.len()..]))
-                                    } else {
-                                        (false, Some(m.source.as_str()))
-                                    }
-                                } else {
-                                    (false, Some(m.source.as_str()))
-                                };
-
-                                let parsed_path = path_str.and_then(|p| tokenizer::parse(p).ok());
-
-                                PrecompiledExplodeMapping {
-                                    target: m.target.clone(),
-                                    transform: m.transform.clone(),
-                                    default: m.default.clone(),
-                                    is_exploded_field,
-                                    is_whole_element: is_whole,
-                                    parsed_path,
-                                }
-                            })
-                            .collect();
-
-                        let rows: Result<Vec<Value>, String> = elements
-                            .par_iter()
-                            .map(|elem| {
-                                let mut row = serde_json::Map::with_capacity(precompiled.len());
-                                for m in &precompiled {
-                                    let extracted = if m.is_exploded_field {
-                                        if m.is_whole_element {
-                                            Some(elem.clone())
-                                        } else if let Some(ref path) = m.parsed_path {
-                                            resolver::resolve(elem, path)
-                                        } else {
-                                            None
-                                        }
-                                    } else if let Some(ref path) = m.parsed_path {
-                                        resolver::resolve(item, path)
-                                    } else {
-                                        None
-                                    };
-
-                                    let val = match extracted {
-                                        Some(v) if !v.is_null() => Some(v),
-                                        _ => m.default.clone(),
-                                    };
-
-                                    if let Some(mut v) = val {
-                                        if let Some(ref tr) = m.transform {
-                                            v = functions::apply_transform_chain(tr, v)
-                                                .map_err(|e| format!("transform error on '{}': {e}", m.target))?;
-                                        }
-                                        row.insert(m.target.clone(), v);
-                                    }
-                                }
-                                Ok(Value::Object(row))
-                            })
-                            .collect();
-
-                        rows
+impl CompiledTarget {
+    fn execute(&self, items: &[Value], is_batch: bool) -> Result<Vec<Value>, String> {
+        let per_item: Vec<Result<Vec<Value>, String>> = items
+            .par_iter()
+            .enumerate()
+            .map(|(i, item)| {
+                self.rows_for(item).map_err(|e| {
+                    if is_batch {
+                        format!("target '{}', item {i}: {e}", self.table)
+                    } else {
+                        format!("target '{}': {e}", self.table)
                     }
-                    _ => Ok(Vec::new()), // No array elements to explode
-                }
-            } else {
-                // Fallback to single row if no array path found
-                let row = self.transform_single_row(&target.mappings, item, item)?;
-                Ok(vec![Value::Object(row)])
-            }
+                })
+            })
+            .collect();
+
+        let mut rows = Vec::with_capacity(items.len());
+        for item_rows in per_item {
+            rows.extend(item_rows?);
         }
+
+        if let Some(ref dedup) = self.dedup {
+            rows = dedup.apply(rows);
+        }
+        Ok(rows)
     }
 
-    fn find_explode_path(&self, target: &TargetSpec) -> Option<String> {
-        for m in &target.mappings {
-            if m.unpack.as_deref() == Some("array_explode") || m.source.contains("[*]") {
-                if let Some(idx) = m.source.find("[*]") {
-                    let prefix = m.source[..idx].trim_end_matches('.');
-                    if !prefix.is_empty() {
-                        return Some(prefix.to_string());
+    fn rows_for(&self, doc: &Value) -> Result<Vec<Value>, String> {
+        if !doc.is_object() {
+            return Err(format!("expected a JSON object, got {}", json_type_name(doc)));
+        }
+        match &self.grain {
+            Grain::Header => Ok(vec![self.row(doc, None)?]),
+            Grain::Line { array, array_name } => match resolver::resolve(doc, array) {
+                // No line items: no line rows.
+                None | Some(Value::Null) => Ok(Vec::new()),
+                Some(Value::Array(elements)) => {
+                    if elements.len() >= PARALLEL_EXPLODE_MIN {
+                        elements.par_iter().map(|e| self.row(doc, Some(e))).collect()
+                    } else {
+                        elements.iter().map(|e| self.row(doc, Some(e))).collect()
                     }
                 }
-            }
+                Some(other) => Err(format!(
+                    "expected an array at '{array_name}' to explode, got {}",
+                    json_type_name(&other)
+                )),
+            },
         }
-        None
     }
 
-    fn transform_single_row(
-        &self,
-        mappings: &[FieldMapping],
-        root: &Value,
-        current: &Value,
-    ) -> Result<serde_json::Map<String, Value>, String> {
-        let mut row = serde_json::Map::with_capacity(mappings.len());
-
-        for m in mappings {
-            let val = self.extract_and_transform(m, root, current)?;
-            if let Some(v) = val {
-                row.insert(m.target.clone(), v);
-            }
-        }
-
-        Ok(row)
-    }
-
-    #[allow(dead_code)]
-    fn transform_exploded_row(
-        &self,
-        mappings: &[FieldMapping],
-        explode_prefix: &str,
-        root: &Value,
-        line_item: &Value,
-    ) -> Result<serde_json::Map<String, Value>, String> {
-        let mut row = serde_json::Map::with_capacity(mappings.len());
-        let explode_pattern = format!("{}[*]", explode_prefix);
-
-        for m in mappings {
-            let is_exploded_field = m.unpack.as_deref() == Some("array_explode") || m.source.starts_with(&explode_pattern);
-
-            let extracted = if is_exploded_field {
-                if m.source == explode_pattern {
-                    // Whole transaction/element
-                    Some(line_item.clone())
-                } else if m.source.starts_with(&format!("{}.", explode_pattern)) {
-                    let subpath = &m.source[explode_pattern.len() + 1..];
-                    let parsed = tokenizer::parse(subpath).map_err(|e| e.to_string())?;
-                    resolver::resolve(line_item, &parsed)
-                } else {
-                    // Relative path from line_item
-                    let parsed = tokenizer::parse(&m.source).map_err(|e| e.to_string())?;
-                    resolver::resolve(line_item, &parsed)
-                }
-            } else {
-                // Broadcast from root/parent document!
-                let parsed = tokenizer::parse(&m.source).map_err(|e| e.to_string())?;
-                resolver::resolve(root, &parsed)
+    fn row(&self, doc: &Value, element: Option<&Value>) -> Result<Value, String> {
+        let mut row = Map::new();
+        for m in &self.mappings {
+            let raw = match &m.source {
+                PipeSource::Literal(v) => Some(v.clone()),
+                PipeSource::Document(path) => resolver::resolve(doc, path),
+                PipeSource::Element(None) => element.cloned(),
+                PipeSource::Element(Some(path)) => element.and_then(|e| resolver::resolve(e, path)),
             };
-
-            let val = match extracted {
+            let value = match raw {
                 Some(v) if !v.is_null() => Some(v),
                 _ => m.default.clone(),
             };
-
-            if let Some(mut v) = val {
-                if let Some(ref transform_chain) = m.transform {
-                    v = functions::apply_transform_chain(transform_chain, v)
+            if let Some(mut v) = value {
+                if !m.chain.is_empty() {
+                    v = functions::apply_compiled_chain(&m.chain, v)
                         .map_err(|e| format!("transform error on '{}': {e}", m.target))?;
                 }
                 row.insert(m.target.clone(), v);
             }
         }
-
-        Ok(row)
-    }
-
-    fn extract_and_transform(
-        &self,
-        mapping: &FieldMapping,
-        root: &Value,
-        _current: &Value,
-    ) -> Result<Option<Value>, String> {
-        let (path_str, inline_tr) = super::converter::parse_source_and_transforms(&mapping.source);
-
-        let extracted = if mapping.literal {
-            Some(Value::String(path_str))
-        } else if !path_str.is_empty() {
-            let parsed = tokenizer::parse(&path_str).map_err(|e| e.to_string())?;
-            resolver::resolve(root, &parsed)
-        } else {
-            None
-        };
-
-        let val = match extracted {
-            Some(v) if !v.is_null() => Some(v),
-            _ => mapping.default.clone(),
-        };
-
-        let mut val = match val {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-
-        let combined_transform = match (&mapping.transform, inline_tr) {
-            (Some(explicit), Some(inline)) => Some(format!("{} | {}", inline, explicit)),
-            (Some(explicit), None) => Some(explicit.clone()),
-            (None, Some(inline)) => Some(inline),
-            (None, None) => None,
-        };
-
-        if let Some(ref tr) = combined_transform {
-            val = functions::apply_transform_chain(tr, val)
-                .map_err(|e| format!("transform error on '{}': {e}", mapping.target))?;
-        }
-
-        Ok(Some(val))
+        Ok(Value::Object(row))
     }
 }
 
-/// Deduplicate rows keeping the latest occurrence based on a composite business key.
-fn deduplicate_latest(rows: Vec<Value>, business_key: &[String]) -> Vec<Value> {
-    let mut seen = HashSet::new();
-    let mut deduped = Vec::with_capacity(rows.len());
+impl Dedup {
+    /// Keep one row per business key. Rows whose key is incomplete (a key column
+    /// missing or null) are never merged — previously they all collapsed into one.
+    /// Surviving rows keep their original relative order.
+    fn apply(&self, rows: Vec<Value>) -> Vec<Value> {
+        let mut winner: HashMap<Vec<String>, usize> = HashMap::new();
+        let mut keep = vec![false; rows.len()];
 
-    // Iterate in reverse to keep latest
-    for row in rows.into_iter().rev() {
-        if let Value::Object(ref obj) = row {
-            let key: Vec<String> = business_key
-                .iter()
-                .map(|k| obj.get(k).map(|v| v.to_string()).unwrap_or_default())
-                .collect();
-
-            if seen.insert(key) {
-                deduped.push(row);
+        for (i, row) in rows.iter().enumerate() {
+            let Some(key) = self.key_of(row) else {
+                keep[i] = true;
+                continue;
+            };
+            match winner.entry(key) {
+                Entry::Vacant(slot) => {
+                    slot.insert(i);
+                }
+                Entry::Occupied(mut slot) => {
+                    let replace = match &self.sequence_by {
+                        // Not `Less` → equal values go to the later row.
+                        Some(col) => {
+                            compare_sequence(row.get(col), rows[*slot.get()].get(col)) != Ordering::Less
+                        }
+                        None => true,
+                    };
+                    if replace {
+                        slot.insert(i);
+                    }
+                }
             }
-        } else {
-            deduped.push(row);
+        }
+        for &i in winner.values() {
+            keep[i] = true;
+        }
+
+        rows.into_iter()
+            .zip(keep)
+            .filter_map(|(row, kept)| kept.then_some(row))
+            .collect()
+    }
+
+    fn key_of(&self, row: &Value) -> Option<Vec<String>> {
+        let obj = row.as_object()?;
+        self.business_key
+            .iter()
+            .map(|col| match obj.get(col) {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(v.to_string()),
+            })
+            .collect()
+    }
+}
+
+/// Total order for `sequence_by` values: missing/null < bool < number < string < other.
+fn compare_sequence(a: Option<&Value>, b: Option<&Value>) -> Ordering {
+    fn rank(v: Option<&Value>) -> u8 {
+        match v {
+            None | Some(Value::Null) => 0,
+            Some(Value::Bool(_)) => 1,
+            Some(Value::Number(_)) => 2,
+            Some(Value::String(_)) => 3,
+            Some(_) => 4,
+        }
+    }
+    match (a, b) {
+        (Some(Value::Number(x)), Some(Value::Number(y))) => {
+            x.as_f64().partial_cmp(&y.as_f64()).unwrap_or(Ordering::Equal)
+        }
+        (Some(Value::String(x)), Some(Value::String(y))) => x.cmp(y),
+        (Some(Value::Bool(x)), Some(Value::Bool(y))) => x.cmp(y),
+        _ => rank(a).cmp(&rank(b)),
+    }
+}
+
+fn is_explode(m: &FieldMapping) -> bool {
+    m.unpack.as_deref() == Some("array_explode")
+}
+
+/// The array to explode: the part before `[*]` of the first `unpack` mapping,
+/// falling back to the first mapping that contains `[*]` at all.
+fn find_explode_prefix(mappings: &[FieldMapping]) -> Option<String> {
+    let prefix_of = |m: &FieldMapping| -> Option<String> {
+        if m.literal {
+            return None;
+        }
+        let (path, _) = parse_source_and_transforms(&m.source);
+        let idx = path.find("[*]")?;
+        let prefix = path[..idx].trim_end_matches('.');
+        (!prefix.is_empty()).then(|| prefix.to_string())
+    };
+    mappings
+        .iter()
+        .filter(|m| is_explode(m))
+        .find_map(prefix_of)
+        .or_else(|| mappings.iter().find_map(prefix_of))
+}
+
+fn compile_target(t: &TargetSpec) -> Result<CompiledTarget, String> {
+    if t.table.is_empty() {
+        return Err("target table name cannot be empty".into());
+    }
+    let err = |msg: String| format!("target '{}': {msg}", t.table);
+
+    if t.mappings.is_empty() {
+        return Err(err("must have at least one mapping".into()));
+    }
+    let mut produced = HashSet::new();
+    for m in &t.mappings {
+        if m.target.is_empty() {
+            return Err(err("a mapping has an empty target".into()));
+        }
+        if !produced.insert(m.target.as_str()) {
+            return Err(err(format!("duplicate mapping target '{}'", m.target)));
+        }
+        if !m.literal && m.source.trim().is_empty() {
+            return Err(err(format!("mapping '{}' has an empty source", m.target)));
+        }
+        if let Some(unpack) = m.unpack.as_deref() {
+            if unpack != "array_explode" {
+                return Err(err(format!(
+                    "mapping '{}': unknown unpack '{unpack}' (expected 'array_explode')",
+                    m.target
+                )));
+            }
+        }
+        if m.nested.is_some() {
+            return Err(err(format!(
+                "mapping '{}': nested recipes are not supported in pipelines",
+                m.target
+            )));
         }
     }
 
-    deduped.reverse();
-    deduped
+    let line = match t.grain.as_deref() {
+        Some("header") => {
+            if let Some(m) = t.mappings.iter().find(|m| is_explode(m)) {
+                return Err(err(format!(
+                    "mapping '{}' uses unpack 'array_explode', which requires grain 'line'",
+                    m.target
+                )));
+            }
+            false
+        }
+        Some("line") => true,
+        // Unspecified: explode when anything asks for it (original behaviour).
+        None => t
+            .mappings
+            .iter()
+            .any(|m| is_explode(m) || (!m.literal && m.source.contains("[*]"))),
+        Some(other) => {
+            return Err(err(format!("unknown grain '{other}' (expected 'header' or 'line')")))
+        }
+    };
+
+    let grain = if line {
+        let array_name = find_explode_prefix(&t.mappings).ok_or_else(|| {
+            err("line grain needs a mapping whose source contains '<array>[*]' to choose the array to explode".into())
+        })?;
+        let array = tokenizer::parse(&array_name)
+            .map_err(|e| err(format!("invalid array path '{array_name}': {e}")))?;
+        Grain::Line { array, array_name }
+    } else {
+        Grain::Header
+    };
+
+    let explode_pattern = match &grain {
+        Grain::Line { array_name, .. } => Some(format!("{array_name}[*]")),
+        Grain::Header => None,
+    };
+    let mappings = t
+        .mappings
+        .iter()
+        .map(|m| {
+            compile_mapping(m, explode_pattern.as_deref())
+                .map_err(|e| err(format!("mapping '{}': {e}", m.target)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let dedup = match t.dedup_strategy.as_deref() {
+        None | Some("none") => {
+            if let Some(ref col) = t.sequence_by {
+                return Err(err(format!(
+                    "sequence_by '{col}' has no effect without dedup_strategy 'latest'"
+                )));
+            }
+            None
+        }
+        Some("latest") => {
+            if t.business_key.is_empty() {
+                return Err(err("dedup_strategy 'latest' requires a non-empty business_key".into()));
+            }
+            for col in t.business_key.iter().chain(t.sequence_by.iter()) {
+                if !produced.contains(col.as_str()) {
+                    return Err(err(format!(
+                        "dedup column '{col}' is not produced by any mapping target"
+                    )));
+                }
+            }
+            Some(Dedup { business_key: t.business_key.clone(), sequence_by: t.sequence_by.clone() })
+        }
+        Some(other) => {
+            return Err(err(format!(
+                "unknown dedup_strategy '{other}' (expected 'latest' or 'none')"
+            )))
+        }
+    };
+
+    Ok(CompiledTarget { table: t.table.clone(), grain, mappings, dedup })
 }
+
+fn compile_mapping(m: &FieldMapping, explode_pattern: Option<&str>) -> Result<PipeMapping, String> {
+    let parse = |p: &str| tokenizer::parse(p).map_err(|e| format!("invalid source path '{p}': {e}"));
+
+    let (source, inline) = if m.literal {
+        (PipeSource::Literal(Value::String(m.source.clone())), None)
+    } else {
+        // Inline pipes (`a.b | trim`) are split off before the path is parsed;
+        // previously exploded fields kept the pipes and silently resolved to nothing.
+        let (path, inline) = parse_source_and_transforms(&m.source);
+        let source = match explode_pattern {
+            Some(pattern) if is_explode(m) || path.starts_with(pattern) => {
+                match path.strip_prefix(pattern) {
+                    Some(rest) => {
+                        let rest = rest.strip_prefix('.').unwrap_or(rest);
+                        PipeSource::Element(if rest.is_empty() { None } else { Some(parse(rest)?) })
+                    }
+                    // `unpack` with a path relative to the exploded element.
+                    None => PipeSource::Element(Some(parse(&path)?)),
+                }
+            }
+            _ => PipeSource::Document(parse(&path)?),
+        };
+        (source, inline)
+    };
+
+    let chain = match (inline, m.transform.as_deref()) {
+        (Some(i), Some(e)) => Some(format!("{i} | {e}")),
+        (Some(i), None) => Some(i),
+        (None, Some(e)) => Some(e.to_string()),
+        (None, None) => None,
+    };
+    let chain = match chain {
+        Some(c) => functions::compile_chain(&c).map_err(|e| e.to_string())?,
+        None => Vec::new(),
+    };
+
+    Ok(PipeMapping { target: m.target.clone(), source, chain, default: m.default.clone() })
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -459,5 +611,120 @@ mod tests {
         assert_eq!(lines[1]["po_id"], "PO-101");
         assert_eq!(lines[1]["quantity"], 10.0);
         assert_eq!(lines[1]["unit_price"], 38.5);
+    }
+
+    // ── Regression tests ────────────────────────────────────────────────
+
+    fn run(spec: Value, input: Value) -> Result<HashMap<String, Vec<Value>>, String> {
+        PipelineSpec::from_value(spec).unwrap().execute(&input)
+    }
+
+    fn compile_err(spec: Value) -> String {
+        PipelineSpec::from_value(spec).unwrap().compile().unwrap_err()
+    }
+
+    #[test]
+    fn exploded_fields_honour_inline_pipes() {
+        let out = run(
+            json!({"targets":[{"table":"t","grain":"line","mappings":[
+                {"source":"id","target":"id"},
+                {"source":"tx[*].qty | to_number","target":"qty","unpack":"array_explode"}]}]}),
+            json!({"id":"A","tx":[{"qty":"5"},{"qty":"7"}]}),
+        )
+        .unwrap();
+        assert_eq!(out["t"], vec![json!({"id":"A","qty":5.0}), json!({"id":"A","qty":7.0})]);
+    }
+
+    #[test]
+    fn explicit_header_grain_is_respected_with_wildcards() {
+        let out = run(
+            json!({"targets":[{"table":"t","grain":"header","mappings":[
+                {"source":"id","target":"id"},{"source":"roles[*].name","target":"roles"}]}]}),
+            json!({"id":"A","roles":[{"name":"x"},{"name":"y"}]}),
+        )
+        .unwrap();
+        assert_eq!(out["t"], vec![json!({"id":"A","roles":["x","y"]})]);
+    }
+
+    #[test]
+    fn literals_work_in_line_grain() {
+        let out = run(
+            json!({"targets":[{"table":"t","grain":"line","mappings":[
+                {"source":"api","target":"src","literal":true},
+                {"source":"tx[*].id","target":"id","unpack":"array_explode"}]}]}),
+            json!({"tx":[{"id":1}]}),
+        )
+        .unwrap();
+        assert_eq!(out["t"], vec![json!({"src":"api","id":1})]);
+    }
+
+    #[test]
+    fn dedup_latest_with_sequence_by_keeps_the_newest_row() {
+        let spec = json!({"targets":[{"table":"t","business_key":["k"],"dedup_strategy":"latest",
+            "sequence_by":"ts","mappings":[
+            {"source":"k","target":"k"},{"source":"v","target":"v"},{"source":"ts","target":"ts"}]}]});
+        let out = run(
+            spec,
+            json!([{"k":"A","v":"new","ts":"2024-12-01"},{"k":"A","v":"old","ts":"2020-01-01"},{"k":"B","v":"b"}]),
+        )
+        .unwrap();
+        assert_eq!(out["t"], vec![json!({"k":"A","v":"new","ts":"2024-12-01"}), json!({"k":"B","v":"b"})]);
+    }
+
+    #[test]
+    fn dedup_without_sequence_by_keeps_the_last_row_in_input_order() {
+        let out = run(
+            json!({"targets":[{"table":"t","business_key":["k"],"dedup_strategy":"latest","mappings":[
+                {"source":"k","target":"k"},{"source":"v","target":"v"}]}]}),
+            json!([{"k":1,"v":"a"},{"k":2,"v":"b"},{"k":1,"v":"c"}]),
+        )
+        .unwrap();
+        assert_eq!(out["t"], vec![json!({"k":2,"v":"b"}), json!({"k":1,"v":"c"})]);
+    }
+
+    #[test]
+    fn rows_missing_the_business_key_are_not_collapsed() {
+        let out = run(
+            json!({"targets":[{"table":"t","business_key":["k"],"dedup_strategy":"latest","mappings":[
+                {"source":"k","target":"k"},{"source":"v","target":"v"}]}]}),
+            json!([{"v":1},{"v":2},{"k":null,"v":3}]),
+        )
+        .unwrap();
+        assert_eq!(out["t"].len(), 3);
+    }
+
+    #[test]
+    fn bad_records_report_target_and_item() {
+        let err = run(
+            json!({"targets":[{"table":"t","mappings":[{"source":"d","target":"d","cast":"date"}]}]}),
+            json!([{"d":"2024-01-01"},{"d":"garbage"}]),
+        )
+        .unwrap_err();
+        assert!(err.starts_with("target 't', item 1: transform error on 'd'"), "got {err}");
+
+        let err = run(json!({"targets":[{"table":"t","mappings":[{"source":"a","target":"a"}]}]}), json!([1]))
+            .unwrap_err();
+        assert!(err.contains("item 0: expected a JSON object"), "got {err}");
+    }
+
+    #[test]
+    fn pipeline_configuration_mistakes_fail_at_compile_time() {
+        let m = json!([{"source":"k","target":"k"}]);
+        assert!(compile_err(json!({"targets":[{"table":"t","mappings":m},{"table":"t","mappings":m}]}))
+            .contains("duplicate target table 't'"));
+        assert!(compile_err(json!({"targets":[{"table":"t","dedup_strategy":"lastest","business_key":["k"],"mappings":m}]}))
+            .contains("unknown dedup_strategy 'lastest'"));
+        assert!(compile_err(json!({"targets":[{"table":"t","dedup_strategy":"latest","mappings":m}]}))
+            .contains("requires a non-empty business_key"));
+        assert!(compile_err(json!({"targets":[{"table":"t","dedup_strategy":"latest","business_key":["kk"],"mappings":m}]}))
+            .contains("'kk' is not produced"));
+        assert!(compile_err(json!({"targets":[{"table":"t","grain":"lines","mappings":m}]}))
+            .contains("unknown grain 'lines'"));
+        assert!(compile_err(json!({"targets":[{"table":"t","grain":"header","mappings":[
+            {"source":"tx[*].a","target":"a","unpack":"array_explode"}]}]}))
+            .contains("requires grain 'line'"));
+        assert!(compile_err(json!({"targets":[{"table":"t","mappings":[
+            {"source":"k","target":"k","cast":"nope"}]}]}))
+            .contains("nope"));
     }
 }

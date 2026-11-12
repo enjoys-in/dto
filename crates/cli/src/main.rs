@@ -4,12 +4,15 @@
 //! Supports both Recipes and JSON Schema, single and batch parallel processing,
 //! and high-resolution performance benchmarking on 100k+ record arrays.
 
+use std::fmt;
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
-use std::path::PathBuf;
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 use dto_core::DtoEngine;
+use serde::de::{Error as _, SeqAccess, Visitor};
+use serde::Deserializer as _;
 use serde_json::{json, Value};
 
 #[derive(Parser, Debug)]
@@ -91,9 +94,204 @@ enum Commands {
     Functions,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+fn main() {
+    if let Err(e) = run(Cli::parse()) {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
 
+/// Load the schema, then transform either the whole input at once or — with
+/// `--chunk-size` and a top-level array — stream it chunk by chunk so that only
+/// one chunk of input and output is in memory at a time.
+fn run_transform(
+    schema: &Path,
+    input: Option<&Path>,
+    pretty: bool,
+    no_validate: bool,
+    chunk_size: Option<usize>,
+) -> Result<(), String> {
+    let schema_content = fs::read_to_string(schema)
+        .map_err(|e| format!("failed to read schema file {}: {e}", schema.display()))?;
+    let mut engine = DtoEngine::from_json(&schema_content)
+        .map_err(|e| format!("invalid schema/recipe: {e}"))?;
+    if no_validate {
+        engine.set_validation(false);
+    }
+    if chunk_size.is_some() && engine.is_pipeline() {
+        return Err("--chunk-size cannot be used with a pipeline: deduplication needs the \
+                    whole input. Run without --chunk-size."
+            .into());
+    }
+
+    let reader: Box<dyn BufRead> = match input {
+        Some(path) => Box::new(io::BufReader::with_capacity(
+            IO_BUFFER,
+            fs::File::open(path)
+                .map_err(|e| format!("failed to read input file {}: {e}", path.display()))?,
+        )),
+        None => Box::new(io::BufReader::with_capacity(IO_BUFFER, io::stdin())),
+    };
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::with_capacity(IO_BUFFER, stdout.lock());
+
+    match chunk_size {
+        Some(cs) => transform_streaming(&engine, reader, &mut out, cs, pretty).map(|_| ())?,
+        None => transform_whole(&engine, reader, &mut out, pretty)?,
+    }
+    out.flush().map_err(|e| format!("failed to write output: {e}"))
+}
+
+const IO_BUFFER: usize = 1 << 20;
+
+/// Parse the whole input, transform it, and write the result.
+fn transform_whole<R: BufRead, W: Write>(
+    engine: &DtoEngine,
+    mut reader: R,
+    out: &mut W,
+    pretty: bool,
+) -> Result<(), String> {
+    let mut text = String::new();
+    reader
+        .read_to_string(&mut text)
+        .map_err(|e| format!("failed to read input: {e}"))?;
+    let input: Value =
+        serde_json::from_str(&text).map_err(|e| format!("input JSON parse error: {e}"))?;
+    drop(text);
+
+    let output = engine.transform(&input).map_err(|e| format!("transform failed: {e}"))?;
+    drop(input);
+
+    let written = if pretty {
+        serde_json::to_writer_pretty(&mut *out, &output)
+    } else {
+        serde_json::to_writer(&mut *out, &output)
+    };
+    written
+        .map_err(io::Error::from)
+        .and_then(|_| out.write_all(b"\n"))
+        .map_err(|e| format!("failed to write output: {e}"))
+}
+
+/// Stream a top-level JSON array `chunk_size` records at a time. Non-array input
+/// falls back to [`transform_whole`]. Returns the number of records written.
+///
+/// On error the process exits non-zero and the output written so far is incomplete.
+fn transform_streaming<R: BufRead, W: Write>(
+    engine: &DtoEngine,
+    mut reader: R,
+    out: &mut W,
+    chunk_size: usize,
+    pretty: bool,
+) -> Result<usize, String> {
+    match first_non_whitespace(&mut reader).map_err(|e| format!("failed to read input: {e}"))? {
+        Some(b'[') => {}
+        _ => return transform_whole(engine, reader, out, pretty).map(|_| 0),
+    }
+
+    out.write_all(b"[").map_err(|e| format!("failed to write output: {e}"))?;
+    let mut de = serde_json::Deserializer::from_reader(reader);
+    let visitor = StreamArray {
+        engine,
+        out: &mut *out,
+        chunk_size: chunk_size.max(1),
+        pretty,
+        written: 0,
+    };
+    let written = (&mut de)
+        .deserialize_seq(visitor)
+        .map_err(|e| format!("transform failed: {e}"))?;
+    de.end().map_err(|e| format!("input JSON parse error: {e}"))?;
+
+    let close: &[u8] = if pretty && written > 0 { b"\n]\n" } else { b"]\n" };
+    out.write_all(close).map_err(|e| format!("failed to write output: {e}"))?;
+    Ok(written)
+}
+
+/// Skip leading whitespace and peek at the first significant byte.
+fn first_non_whitespace<R: BufRead>(reader: &mut R) -> io::Result<Option<u8>> {
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        match buf.iter().position(|b| !b.is_ascii_whitespace()) {
+            Some(i) => {
+                let byte = buf[i];
+                reader.consume(i);
+                return Ok(Some(byte));
+            }
+            None => {
+                let n = buf.len();
+                reader.consume(n);
+            }
+        }
+    }
+}
+
+/// serde visitor that pulls array elements one at a time, transforming and
+/// writing them every `chunk_size` records.
+struct StreamArray<'a, W: Write> {
+    engine: &'a DtoEngine,
+    out: &'a mut W,
+    chunk_size: usize,
+    pretty: bool,
+    written: usize,
+}
+
+impl<W: Write> StreamArray<'_, W> {
+    fn flush_chunk(&mut self, buf: &mut Vec<Value>) -> Result<(), String> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let outputs = self
+            .engine
+            .transform_items(buf, self.written)
+            .map_err(|e| e.to_string())?;
+        buf.clear();
+        for item in &outputs {
+            write_array_item(self.out, item, self.written == 0, self.pretty)
+                .map_err(|e| format!("failed to write output: {e}"))?;
+            self.written += 1;
+        }
+        Ok(())
+    }
+}
+
+impl<'de, W: Write> Visitor<'de> for StreamArray<'_, W> {
+    type Value = usize;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON array of records")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(mut self, mut seq: A) -> Result<usize, A::Error> {
+        let mut buf = Vec::with_capacity(self.chunk_size);
+        while let Some(item) = seq.next_element::<Value>()? {
+            buf.push(item);
+            if buf.len() >= self.chunk_size {
+                self.flush_chunk(&mut buf).map_err(A::Error::custom)?;
+            }
+        }
+        self.flush_chunk(&mut buf).map_err(A::Error::custom)?;
+        Ok(self.written)
+    }
+}
+
+fn write_array_item<W: Write>(out: &mut W, item: &Value, first: bool, pretty: bool) -> io::Result<()> {
+    if !first {
+        out.write_all(b",")?;
+    }
+    if pretty {
+        let text = serde_json::to_string_pretty(item)?;
+        out.write_all(b"\n  ")?;
+        out.write_all(text.replace('\n', "\n  ").as_bytes())
+    } else {
+        serde_json::to_writer(&mut *out, item).map_err(io::Error::from)
+    }
+}
+
+fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Transform {
             schema,
@@ -102,72 +300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_validate,
             chunk_size,
         } => {
-            let schema_content = fs::read_to_string(&schema)
-                .map_err(|e| format!("Failed to read schema file {:?}: {e}", schema))?;
-
-            let input_content = match input {
-                Some(path) => fs::read_to_string(&path)
-                    .map_err(|e| format!("Failed to read input file {:?}: {e}", path))?,
-                None => {
-                    let mut buf = String::new();
-                    io::stdin().read_to_string(&mut buf)?;
-                    buf
-                }
-            };
-
-            let mut engine = DtoEngine::from_json(&schema_content)
-                .map_err(|e| format!("Schema/Recipe error: {e}"))?;
-
-            if no_validate {
-                engine.set_validation(false);
-            }
-
-            let input_val: serde_json::Value = serde_json::from_str(&input_content)
-                .map_err(|e| format!("Input JSON parse error: {e}"))?;
-
-            // If micro-batch streaming is requested and input is an array, stream chunks
-            if let Some(cs) = chunk_size {
-                if let Value::Array(items) = input_val {
-                    let mut stdout = io::stdout().lock();
-                    write!(stdout, "[")?;
-                    let mut is_first = true;
-
-                    engine.transform_stream(items, cs, |chunk| {
-                        for item in chunk {
-                            if !is_first {
-                                write!(stdout, ",").map_err(|e| dto_core::schema::transform::TransformError::Schema(e.to_string()))?;
-                            }
-                            is_first = false;
-
-                            if pretty {
-                                write!(stdout, "\n  {}", serde_json::to_string_pretty(&item).map_err(|e| dto_core::schema::transform::TransformError::Schema(e.to_string()))?).map_err(|e| dto_core::schema::transform::TransformError::Schema(e.to_string()))?;
-                            } else {
-                                write!(stdout, "{}", serde_json::to_string(&item).map_err(|e| dto_core::schema::transform::TransformError::Schema(e.to_string()))?).map_err(|e| dto_core::schema::transform::TransformError::Schema(e.to_string()))?;
-                            }
-                        }
-                        stdout.flush().map_err(|e| dto_core::schema::transform::TransformError::Schema(e.to_string()))?;
-                        Ok(())
-                    }).map_err(|e| format!("Streaming transform error: {e}"))?;
-
-                    if pretty {
-                        writeln!(stdout, "\n]")?;
-                    } else {
-                        writeln!(stdout, "]")?;
-                    }
-                    return Ok(());
-                }
-            }
-
-            let output = engine.transform(&input_val)
-                .map_err(|e| format!("Transform error: {e}"))?;
-
-            let output_str = if pretty {
-                serde_json::to_string_pretty(&output)?
-            } else {
-                serde_json::to_string(&output)?
-            };
-
-            println!("{output_str}");
+            run_transform(&schema, input.as_deref(), pretty, no_validate, chunk_size)?;
         }
 
         Commands::Validate { schema } => {
@@ -205,9 +338,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("    - uppercase   : Convert string to uppercase (alias: upper)");
             println!("    - reverse     : Reverse characters in string");
             println!("\n  Type casts:");
-            println!("    - to_string   : Cast number, boolean, or object to string");
-            println!("    - to_number   : Parse string to number (or bool to 1/0)");
-            println!("    - to_bool     : Cast truthy/falsy value to boolean");
+            println!("    - to_string   : Cast number, boolean, or object to string (alias: string)");
+            println!("    - to_number   : Parse string to number, or bool to 1/0");
+            println!("                    (aliases: number, decimal, float, int, integer)");
+            println!("    - to_bool     : Cast truthy/falsy value to boolean (aliases: bool, boolean)");
+            println!("    - date        : ISO-8601 date/date-time or Unix epoch -> YYYY-MM-DD (errors on invalid dates)");
+            println!("    - timestamp   : ISO-8601 date/date-time or Unix epoch -> YYYY-MM-DDTHH:MM:SS[.f][offset]");
+            println!("    - json        : Pass the value through unchanged (keeps objects/arrays as-is)");
             println!("\n  Array / Object operations:");
             println!("    - first       : Extract first array element");
             println!("    - last        : Extract last array element");
@@ -815,5 +952,56 @@ mod tests {
         // Ensure size is approximately 6.4 KB (+/- 10%)
         let kb = s.len() as f64 / 1024.0;
         assert!(kb >= 5.5 && kb <= 7.0, "Expected ~6.4 KB, got {:.2} KB", kb);
+    }
+
+    const RECIPE: &str = r#"{"name":"T","mappings":[
+        {"source":"id","target":"id"},{"source":"name | trim | uppercase","target":"name"}],
+        "required":["id"]}"#;
+
+    fn stream(input: &str, chunk: usize, pretty: bool) -> Result<(usize, String), String> {
+        let engine = DtoEngine::from_json(RECIPE).unwrap();
+        let mut out = Vec::new();
+        let n = transform_streaming(&engine, io::Cursor::new(input.as_bytes()), &mut out, chunk, pretty)?;
+        Ok((n, String::from_utf8(out).unwrap()))
+    }
+
+    fn whole(input: &str, pretty: bool) -> String {
+        let engine = DtoEngine::from_json(RECIPE).unwrap();
+        let mut out = Vec::new();
+        transform_whole(&engine, io::Cursor::new(input.as_bytes()), &mut out, pretty).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn streaming_matches_whole_input_output() {
+        let input = serde_json::to_string(
+            &(0..25).map(|i| json!({"id": i, "name": format!(" n{i} ")})).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for chunk in [1, 4, 25, 100] {
+            for pretty in [false, true] {
+                let (n, streamed) = stream(&format!("  \n{input}\n"), chunk, pretty).unwrap();
+                assert_eq!(n, 25);
+                let a: Value = serde_json::from_str(&streamed).unwrap();
+                let b: Value = serde_json::from_str(&whole(&input, pretty)).unwrap();
+                assert_eq!(a, b, "chunk={chunk} pretty={pretty}");
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_reports_position_in_full_input() {
+        let err = stream(r#"[{"id":1},{"id":2},{"id":3},{"nope":4},{"id":5}]"#, 2, false).unwrap_err();
+        assert!(err.contains("item 3: required field 'id'"), "got {err}");
+    }
+
+    #[test]
+    fn streaming_handles_empty_and_non_array_input() {
+        assert_eq!(stream("[]", 10, false).unwrap(), (0, "[]\n".to_string()));
+        assert_eq!(stream("[ ]", 10, true).unwrap().1, "[]\n");
+        // A single object falls back to a whole-input transform.
+        let (_, out) = stream(r#" {"id":7,"name":"x"}"#, 10, false).unwrap();
+        assert_eq!(out, "{\"id\":7,\"name\":\"X\"}\n");
+        assert!(stream(r#"[{"id":1}] trailing"#, 10, false).is_err());
     }
 }

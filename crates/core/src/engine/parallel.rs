@@ -1,166 +1,73 @@
-//! Parallel batch transformation engine using Rayon.
+//! Parallel batch transformation using Rayon.
 //!
-//! When transforming an array of objects, each element is processed on a
-//! separate Rayon thread-pool worker — fully non-blocking and memory-efficient.
+//! Each element of a batch is transformed on the Rayon thread pool against a
+//! [`CompiledObject`] plan, so paths and transform chains are parsed once per
+//! batch rather than once per field per record.
 
 use rayon::prelude::*;
 use serde_json::Value;
 
-use crate::path::{tokenizer, resolver};
-use crate::functions;
-use crate::schema::model::{DtoSchema, FieldSchema};
+use super::compiled::CompiledObject;
+use crate::schema::model::DtoSchema;
 use crate::schema::transform::TransformError;
 
 /// Transform a batch of JSON objects in parallel.
 ///
 /// Each item in `items` is transformed independently using `schema`.
-/// Errors are collected per-item; the first error short-circuits that item only,
-/// not the entire batch.
+/// Errors are collected per item; one failing item does not stop the others.
 ///
 /// Returns `(successes, errors)`:
-/// - `successes`: Vec of (original_index, transformed_value)
-/// - `errors`: Vec of (original_index, error)
+/// - `successes`: Vec of (original_index, transformed_value), in input order
+/// - `errors`: Vec of (original_index, error), in input order
+///
+/// If the schema itself is invalid, `successes` is empty and `errors` holds a
+/// single entry at index 0 describing the schema problem.
 pub fn transform_batch_parallel(
     schema: &DtoSchema,
     items: &[Value],
 ) -> (Vec<(usize, Value)>, Vec<(usize, TransformError)>) {
-    let results: Vec<(usize, Result<Value, TransformError>)> = items
-        .par_iter()
-        .enumerate()
-        .map(|(idx, item)| {
-            let result = transform_single(schema, item);
-            (idx, result)
-        })
-        .collect();
-
-    let mut successes = Vec::with_capacity(results.len());
-    let mut errors = Vec::new();
-
-    for (idx, result) in results {
-        match result {
-            Ok(val) => successes.push((idx, val)),
-            Err(err) => errors.push((idx, err)),
-        }
+    match CompiledObject::from_schema(schema) {
+        Ok(plan) => partition(transform_each(&plan, items)),
+        Err(e) => (Vec::new(), vec![(0, e)]),
     }
-
-    // Sort successes by index to preserve original order.
-    successes.sort_by_key(|(idx, _)| *idx);
-
-    (successes, errors)
 }
 
-/// Transform a batch, returning only the successful results in original order.
-/// Returns an error if ALL items fail.
+/// Transform a batch, returning every result in original order.
+///
+/// Returns `Err` with all per-item errors if **any** item fails. (Previously
+/// failing items were silently dropped unless every item failed.)
 pub fn transform_batch_parallel_values(
     schema: &DtoSchema,
     items: &[Value],
 ) -> Result<Vec<Value>, Vec<(usize, TransformError)>> {
     let (successes, errors) = transform_batch_parallel(schema, items);
-
-    if successes.is_empty() && !errors.is_empty() {
-        return Err(errors);
+    if errors.is_empty() {
+        Ok(successes.into_iter().map(|(_, v)| v).collect())
+    } else {
+        Err(errors)
     }
-
-    Ok(successes.into_iter().map(|(_, v)| v).collect())
 }
 
-/// Transform a single JSON object using a schema.
-/// This is the non-blocking, per-item transform called by the parallel engine.
-fn transform_single(
-    schema: &DtoSchema,
-    input: &Value,
-) -> Result<Value, TransformError> {
-    let mut output = serde_json::Map::with_capacity(schema.properties.len());
-
-    for (field_name, field_schema) in &schema.properties {
-        match transform_field(field_name, field_schema, input)? {
-            Some(value) => {
-                output.insert(field_name.clone(), value);
-            }
-            None => {
-                // Check if required
-                if schema.required.contains(field_name) {
-                    return Err(TransformError::MissingRequired {
-                        field: field_name.clone(),
-                    });
-                }
-            }
-        }
-    }
-
-    Ok(Value::Object(output))
+/// Transform every item in parallel, keeping one result per input in order.
+pub(crate) fn transform_each(
+    plan: &CompiledObject,
+    items: &[Value],
+) -> Vec<Result<Value, TransformError>> {
+    items.par_iter().map(|item| plan.transform(item)).collect()
 }
 
-/// Transform a single field: resolve path → apply transform → return value.
-fn transform_field(
-    field_name: &str,
-    field_schema: &FieldSchema,
-    input: &Value,
-) -> Result<Option<Value>, TransformError> {
-    // Step 1: Resolve the source path (and support inline pipe chaining)
-    let (from_path, inline_transforms) = if let Some(ref from_str) = field_schema.from {
-        if from_str.contains('|') {
-            let mut parts = from_str.split('|');
-            let path = parts.next().unwrap_or("").trim().to_string();
-            let tr: Vec<&str> = parts.map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-            (path, if tr.is_empty() { None } else { Some(tr.join(" | ")) })
-        } else {
-            (from_str.clone(), None)
-        }
-    } else {
-        (String::new(), None)
-    };
-
-    let resolved = if !from_path.is_empty() {
-        let path = tokenizer::parse(&from_path)?;
-        resolver::resolve(input, &path)
-    } else {
-        None
-    };
-
-    // Step 2: Apply default if needed.
-    let value = match resolved {
-        Some(v) if !v.is_null() => Some(v),
-        _ => field_schema.default.clone(),
-    };
-
-    // Step 3: If still None, return None (caller handles required check).
-    let mut value = match value {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-
-    // Step 4: Apply transform chain (combining inline and explicit).
-    let transform_chain = match (&field_schema.transform, inline_transforms) {
-        (Some(explicit), Some(inline)) => Some(format!("{} | {}", inline, explicit)),
-        (Some(explicit), None) => Some(explicit.clone()),
-        (None, Some(inline)) => Some(inline),
-        (None, None) => None,
-    };
-
-    if let Some(ref chain) = transform_chain {
-        value = functions::apply_transform_chain(chain, value)
-            .map_err(|e| TransformError::TransformFunction {
-                field: field_name.to_string(),
-                message: e.to_string(),
-            })?;
-    }
-
-    // Step 5: Handle nested object schemas recursively.
-    if field_schema.field_type == "object" && !field_schema.properties.is_empty() {
-        if let Value::Object(_) = &value {
-            let nested_schema = DtoSchema {
-                title: None,
-                schema_type: "object".to_string(),
-                properties: field_schema.properties.clone(),
-                items: None,
-                required: field_schema.required.clone(),
-            };
-            value = transform_single(&nested_schema, &value)?;
+fn partition(
+    results: Vec<Result<Value, TransformError>>,
+) -> (Vec<(usize, Value)>, Vec<(usize, TransformError)>) {
+    let mut successes = Vec::with_capacity(results.len());
+    let mut errors = Vec::new();
+    for (idx, result) in results.into_iter().enumerate() {
+        match result {
+            Ok(v) => successes.push((idx, v)),
+            Err(e) => errors.push((idx, e)),
         }
     }
-
-    Ok(Some(value))
+    (successes, errors)
 }
 
 #[cfg(test)]
@@ -168,6 +75,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+    use crate::schema::model::FieldSchema;
 
     fn make_schema(props: Vec<(&str, FieldSchema)>, required: Vec<&str>) -> DtoSchema {
         DtoSchema {
@@ -292,7 +200,8 @@ mod tests {
             }
         });
 
-        let result = transform_single(&schema, &input).unwrap();
+        let plan = CompiledObject::from_schema(&schema).unwrap();
+        let result = plan.transform(&input).unwrap();
         assert_eq!(result["emails"], json!(["a@b.com", "c@d.com", "e@f.com"]));
     }
 
@@ -301,5 +210,27 @@ mod tests {
         let schema = make_schema(vec![("x", field("y"))], vec![]);
         let results = transform_batch_parallel_values(&schema, &[]).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn values_variant_fails_when_any_item_fails() {
+        // Regression: one bad record among good ones used to be dropped silently.
+        let schema = make_schema(vec![("name", field("user.name"))], vec!["name"]);
+        let items = vec![
+            json!({ "user": { "name": "Alice" } }),
+            json!({ "other": "data" }),
+            json!({ "user": { "name": "Charlie" } }),
+        ];
+        let errors = transform_batch_parallel_values(&schema, &items).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, 1);
+    }
+
+    #[test]
+    fn invalid_schema_is_reported_not_skipped() {
+        let schema = make_schema(vec![("x", field_with_transform("y", "nope"))], vec![]);
+        let (ok, errors) = transform_batch_parallel(&schema, &[json!({ "y": 1 })]);
+        assert!(ok.is_empty());
+        assert!(errors[0].1.to_string().contains("nope"));
     }
 }

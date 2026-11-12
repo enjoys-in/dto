@@ -1,22 +1,29 @@
-//! Unified API — the main entry point that accepts either Recipe or JSON Schema
-//! and provides a single, ergonomic transformation interface.
+//! Unified API — the main entry point that accepts a Recipe, a JSON Schema or a
+//! Medallion pipeline and provides a single, ergonomic transformation interface.
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
 use serde_json::Value;
 
-use crate::recipe::model::Recipe;
-use crate::recipe::parser::{detect_and_parse, SchemaInput};
-use crate::recipe::converter::recipe_to_schema;
-use crate::schema::model::DtoSchema;
-use crate::schema::transform::TransformError;
-use super::parallel::{transform_batch_parallel, transform_batch_parallel_values};
+use super::compiled::CompiledObject;
 use super::validator::{validate_output, ValidationError};
+use crate::recipe::converter::recipe_to_schema;
+use crate::recipe::model::{Constraint, Recipe};
+use crate::recipe::parser::{detect_and_parse, SchemaInput};
+use crate::recipe::pipeline::{CompiledPipeline, PipelineSpec};
+use crate::schema::model::DtoSchema;
+use crate::schema::transform::{json_type_name, TransformError};
+
+const PIPELINE_NOT_CHUNKABLE: &str = "chunked/streaming transforms are not supported for \
+    pipelines: deduplication needs the whole input, so call transform() on the full input";
 
 /// The unified DTO transformation engine.
 ///
-/// Accepts either a Recipe or a JSON Schema and transforms data accordingly.
-/// Supports single-object and batch (array) processing with Rayon parallelism.
+/// Accepts a Recipe, a JSON Schema or a multi-target pipeline, compiles it once
+/// (paths, transform chains, required fields — configuration errors surface
+/// here), and transforms data accordingly. Arrays are processed in parallel
+/// with Rayon.
 ///
 /// # Example (Recipe format)
 /// ```rust
@@ -47,14 +54,18 @@ use super::validator::{validate_output, ValidationError};
 /// assert_eq!(output["city"], "NYC");
 /// ```
 pub struct DtoEngine {
-    /// The compiled schema (both Recipe and JSON Schema are normalized to this).
-    schema: Option<DtoSchema>,
-    /// Multi-target Medallion Pipeline (for sources / targets schemas).
-    pipeline: Option<crate::recipe::pipeline::PipelineSpec>,
+    mode: Mode,
     /// Original recipe constraints (if input was a Recipe).
-    constraints: HashMap<String, crate::recipe::model::Constraint>,
+    constraints: HashMap<String, Constraint>,
     /// Whether to validate output against constraints.
     validate: bool,
+}
+
+enum Mode {
+    /// Recipe or JSON Schema, normalized to a schema and compiled.
+    Object { schema: DtoSchema, plan: CompiledObject },
+    /// Multi-target Medallion pipeline.
+    Pipeline(CompiledPipeline),
 }
 
 /// Result of a batch transformation, containing successes and per-item errors.
@@ -62,9 +73,12 @@ pub struct DtoEngine {
 pub struct BatchResult {
     /// Successfully transformed items in original order.
     pub items: Vec<Value>,
+    /// Original input index of each entry in `items` (they differ once an item fails).
+    pub indices: Vec<usize>,
     /// Items that failed transformation: (original_index, error).
     pub errors: Vec<(usize, TransformError)>,
-    /// Validation errors for successfully transformed items (if constraints enabled).
+    /// Validation errors for successfully transformed items: (original_index, errors).
+    /// These items are still present in `items`.
     pub validation_errors: Vec<(usize, Vec<ValidationError>)>,
 }
 
@@ -83,23 +97,23 @@ impl DtoEngine {
 
     /// Create an engine from a `Recipe`.
     pub fn from_recipe(recipe: Recipe) -> Result<Self, TransformError> {
-        let constraints = recipe.constraints.clone();
+        recipe.validate().map_err(|e| TransformError::Schema(e.to_string()))?;
         let schema = recipe_to_schema(&recipe)
             .map_err(|e| TransformError::Schema(e.to_string()))?;
+        let plan = CompiledObject::from_schema(&schema)?;
 
         Ok(Self {
-            schema: Some(schema),
-            pipeline: None,
-            constraints,
+            mode: Mode::Object { schema, plan },
+            constraints: recipe.constraints,
             validate: true,
         })
     }
 
     /// Create an engine from a multi-target `PipelineSpec`.
-    pub fn from_pipeline(pipeline: crate::recipe::pipeline::PipelineSpec) -> Result<Self, TransformError> {
+    pub fn from_pipeline(pipeline: PipelineSpec) -> Result<Self, TransformError> {
+        let compiled = pipeline.compile().map_err(TransformError::Schema)?;
         Ok(Self {
-            schema: None,
-            pipeline: Some(pipeline),
+            mode: Mode::Pipeline(compiled),
             constraints: HashMap::new(),
             validate: false,
         })
@@ -107,12 +121,11 @@ impl DtoEngine {
 
     /// Create an engine from a JSON Schema `serde_json::Value`.
     pub fn from_json_schema_value(value: &Value) -> Result<Self, TransformError> {
-        let schema: DtoSchema = serde_json::from_value(value.clone())
-            .map_err(|e| TransformError::Schema(e.to_string()))?;
+        let schema = DtoSchema::from_value(value)?;
+        let plan = CompiledObject::from_schema(&schema)?;
 
         Ok(Self {
-            schema: Some(schema),
-            pipeline: None,
+            mode: Mode::Object { schema, plan },
             constraints: HashMap::new(),
             validate: false,
         })
@@ -123,149 +136,150 @@ impl DtoEngine {
         self.validate = enabled;
     }
 
+    /// Whether this engine runs a multi-target pipeline (output is `{table: rows}`).
+    pub fn is_pipeline(&self) -> bool {
+        matches!(self.mode, Mode::Pipeline(_))
+    }
+
     /// Transform a single JSON value.
     ///
-    /// - If `input` is an object: transforms it into a single output object (or multi-table object).
-    /// - If `input` is an array: transforms each element in parallel.
+    /// - Object input: transformed into a single output object (or `{table: rows}` for pipelines).
+    /// - Array input: every element is transformed in parallel. If **any** element
+    ///   fails (missing required field, bad cast, constraint violation, non-object
+    ///   element) the whole call fails with an error naming that element's index.
+    ///   Use [`DtoEngine::transform_batch`] to keep the successes instead.
     pub fn transform(&self, input: &Value) -> Result<Value, TransformError> {
-        // Multi-target pipeline path
-        if let Some(ref pipeline) = self.pipeline {
-            let res = pipeline.execute(input)
-                .map_err(TransformError::Schema)?;
-            let mut map = serde_json::Map::new();
-            for (table, rows) in res {
-                map.insert(table, Value::Array(rows));
+        let plan = match &self.mode {
+            Mode::Pipeline(pipeline) => {
+                let tables = pipeline.execute(input).map_err(TransformError::Pipeline)?;
+                return Ok(tables_to_value(tables));
             }
-            return Ok(Value::Object(map));
-        }
-
-        let schema = self.schema.as_ref().ok_or_else(|| {
-            TransformError::Schema("engine has neither schema nor pipeline configured".to_string())
-        })?;
+            Mode::Object { plan, .. } => plan,
+        };
 
         match input {
-            Value::Array(items) => {
-                let results = transform_batch_parallel_values(schema, items)
-                    .map_err(|errs| errs.into_iter().next().unwrap().1)?;
-
-                // Validate if constraints exist
-                if self.validate && !self.constraints.is_empty() {
-                    for (idx, item) in results.iter().enumerate() {
-                        if let Err(validation_errs) = validate_output(item, &self.constraints) {
-                            return Err(TransformError::Validation {
-                                index: idx,
-                                errors: validation_errs.into_iter().map(|e| e.to_string()).collect(),
-                            });
-                        }
-                    }
-                }
-
-                Ok(Value::Array(results))
-            }
+            Value::Array(items) => self.transform_items(items, 0).map(Value::Array),
             Value::Object(_) => {
-                let items = [input.clone()];
-                let results = transform_batch_parallel_values(schema, &items)
-                    .map_err(|errs| errs.into_iter().next().unwrap().1)?;
-
-                let result = results.into_iter().next().unwrap_or(Value::Null);
-
-                if self.validate && !self.constraints.is_empty() {
-                    if let Err(validation_errs) = validate_output(&result, &self.constraints) {
-                        return Err(TransformError::Validation {
-                            index: 0,
-                            errors: validation_errs.into_iter().map(|e| e.to_string()).collect(),
-                        });
-                    }
-                }
-
-                Ok(result)
+                let output = plan.transform(input)?;
+                self.check_constraints(&output, 0)?;
+                Ok(output)
             }
-            _ => Err(TransformError::Schema(
-                "input must be a JSON object or array of objects".into(),
-            )),
+            other => Err(TransformError::Schema(format!(
+                "input must be a JSON object or array of objects, got {}",
+                json_type_name(other)
+            ))),
         }
+    }
+
+    /// Transform a slice of records in parallel, failing on the first bad record.
+    ///
+    /// `base_index` is added to item positions in error messages, so callers that
+    /// feed a large input in pieces can report positions in the full input.
+    /// Not available for pipelines (see [`DtoEngine::is_pipeline`]).
+    pub fn transform_items(
+        &self,
+        items: &[Value],
+        base_index: usize,
+    ) -> Result<Vec<Value>, TransformError> {
+        let plan = self.object_plan()?;
+        let results: Vec<Result<Value, TransformError>> = items
+            .par_iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let index = base_index + i;
+                let output = plan.transform(item).map_err(|e| e.at_item(index))?;
+                self.check_constraints(&output, index)?;
+                Ok(output)
+            })
+            .collect();
+        // Collecting in order returns the error of the lowest failing index.
+        results.into_iter().collect()
     }
 
     /// Transform a batch with detailed results (successes + per-item errors).
     pub fn transform_batch(&self, items: &[Value]) -> BatchResult {
-        if let Some(ref pipeline) = self.pipeline {
-            let batch_val = Value::Array(items.to_vec());
-            match pipeline.execute(&batch_val) {
-                Ok(res) => {
-                    let mut map = serde_json::Map::new();
-                    for (table, rows) in res {
-                        map.insert(table, Value::Array(rows));
-                    }
-                    return BatchResult {
-                        items: vec![Value::Object(map)],
+        let plan = match &self.mode {
+            Mode::Pipeline(pipeline) => {
+                return match pipeline.execute_items(items, true) {
+                    Ok(tables) => BatchResult {
+                        items: vec![tables_to_value(tables)],
+                        indices: vec![0],
                         errors: Vec::new(),
                         validation_errors: Vec::new(),
-                    };
-                }
-                Err(e) => {
-                    return BatchResult {
+                    },
+                    Err(e) => BatchResult {
                         items: Vec::new(),
-                        errors: vec![(0, TransformError::Schema(e))],
+                        indices: Vec::new(),
+                        errors: vec![(0, TransformError::Pipeline(e))],
                         validation_errors: Vec::new(),
-                    };
-                }
-            }
-        }
-
-        let schema = match self.schema.as_ref() {
-            Some(s) => s,
-            None => {
-                return BatchResult {
-                    items: Vec::new(),
-                    errors: vec![(0, TransformError::Schema("no schema configured".into()))],
-                    validation_errors: Vec::new(),
+                    },
                 };
             }
+            Mode::Object { plan, .. } => plan,
         };
 
-        let (successes, errors) = transform_batch_parallel(schema, items);
+        /// Transformed record plus its constraint violations (if any).
+        type Outcome = Result<(Value, Option<Vec<ValidationError>>), TransformError>;
 
-        let mut validation_errors = Vec::new();
+        let check = self.validate && !self.constraints.is_empty();
+        let results: Vec<Outcome> = items
+            .par_iter()
+            .map(|item| {
+                let output = plan.transform(item)?;
+                let invalid = if check {
+                    validate_output(&output, &self.constraints).err()
+                } else {
+                    None
+                };
+                Ok((output, invalid))
+            })
+            .collect();
 
-        if self.validate && !self.constraints.is_empty() {
-            for (idx, item) in &successes {
-                if let Err(errs) = validate_output(item, &self.constraints) {
-                    validation_errors.push((*idx, errs));
+        let mut batch = BatchResult {
+            items: Vec::with_capacity(items.len()),
+            indices: Vec::with_capacity(items.len()),
+            errors: Vec::new(),
+            validation_errors: Vec::new(),
+        };
+        for (idx, result) in results.into_iter().enumerate() {
+            match result {
+                Ok((output, invalid)) => {
+                    if let Some(errs) = invalid {
+                        batch.validation_errors.push((idx, errs));
+                    }
+                    batch.items.push(output);
+                    batch.indices.push(idx);
                 }
+                Err(e) => batch.errors.push((idx, e)),
             }
         }
-
-        BatchResult {
-            items: successes.into_iter().map(|(_, v)| v).collect(),
-            errors,
-            validation_errors,
-        }
+        batch
     }
 
     /// Get a reference to the compiled schema (if in single-schema mode).
     pub fn schema(&self) -> Option<&DtoSchema> {
-        self.schema.as_ref()
+        match &self.mode {
+            Mode::Object { schema, .. } => Some(schema),
+            Mode::Pipeline(_) => None,
+        }
     }
 
-    /// Transform an array in micro-batches with bounded peak memory usage.
+    /// Transform an array `chunk_size` records at a time.
     ///
-    /// When transforming 100k or millions of records, processing in chunks of `chunk_size`
-    /// (e.g. 2,000 to 5,000) keeps peak RSS memory bounded while retaining
-    /// maximum Rayon multi-threaded throughput.
+    /// All output is accumulated and returned, so this does **not** bound memory;
+    /// use [`DtoEngine::transform_stream`] for that. Error positions refer to
+    /// `items`. Not available for pipelines.
     pub fn transform_chunks(
         &self,
         items: &[Value],
         chunk_size: usize,
     ) -> Result<Vec<Value>, TransformError> {
+        self.object_plan()?;
         let chunk_size = chunk_size.max(1);
         let mut all_results = Vec::with_capacity(items.len());
 
-        for chunk in items.chunks(chunk_size) {
-            let chunk_val = Value::Array(chunk.to_vec());
-            let transformed = self.transform(&chunk_val)?;
-            if let Value::Array(mut arr) = transformed {
-                all_results.append(&mut arr);
-            }
+        for (n, chunk) in items.chunks(chunk_size).enumerate() {
+            all_results.extend(self.transform_items(chunk, n * chunk_size)?);
         }
 
         Ok(all_results)
@@ -273,9 +287,10 @@ impl DtoEngine {
 
     /// Stream transform an iterator of items through a chunk callback.
     ///
-    /// This allows zero-accumulation streaming: each chunk is transformed on the Rayon
-    /// thread pool and immediately passed to `on_chunk` (e.g., written to stdout/file)
-    /// before dropping the chunk from memory.
+    /// At most `chunk_size` input records and their outputs are held at once:
+    /// each chunk is transformed on the Rayon pool and handed to `on_chunk`
+    /// (e.g. written to stdout/file) before the next one is read. Error positions
+    /// refer to the whole stream. Not available for pipelines.
     pub fn transform_stream<I, F>(
         &self,
         items: I,
@@ -286,6 +301,7 @@ impl DtoEngine {
         I: IntoIterator<Item = Value>,
         F: FnMut(Vec<Value>) -> Result<(), TransformError>,
     {
+        self.object_plan()?;
         let chunk_size = chunk_size.max(1);
         let mut buffer = Vec::with_capacity(chunk_size);
         let mut total_processed = 0;
@@ -293,33 +309,49 @@ impl DtoEngine {
         for item in items {
             buffer.push(item);
             if buffer.len() >= chunk_size {
-                let chunk_items = std::mem::replace(&mut buffer, Vec::with_capacity(chunk_size));
-                let chunk_val = Value::Array(chunk_items);
-                let transformed = self.transform(&chunk_val)?;
-                if let Value::Array(arr) = transformed {
-                    total_processed += arr.len();
-                    on_chunk(arr)?;
-                }
+                let transformed = self.transform_items(&buffer, total_processed)?;
+                total_processed += buffer.len();
+                buffer.clear();
+                on_chunk(transformed)?;
             }
         }
 
         if !buffer.is_empty() {
-            let chunk_val = Value::Array(buffer);
-            let transformed = self.transform(&chunk_val)?;
-            if let Value::Array(arr) = transformed {
-                total_processed += arr.len();
-                on_chunk(arr)?;
-            }
+            let transformed = self.transform_items(&buffer, total_processed)?;
+            total_processed += buffer.len();
+            on_chunk(transformed)?;
         }
 
         Ok(total_processed)
     }
+
+    fn object_plan(&self) -> Result<&CompiledObject, TransformError> {
+        match &self.mode {
+            Mode::Object { plan, .. } => Ok(plan),
+            Mode::Pipeline(_) => Err(TransformError::Schema(PIPELINE_NOT_CHUNKABLE.into())),
+        }
+    }
+
+    fn check_constraints(&self, output: &Value, index: usize) -> Result<(), TransformError> {
+        if !self.validate || self.constraints.is_empty() {
+            return Ok(());
+        }
+        validate_output(output, &self.constraints).map_err(|errs| {
+            let mut errors: Vec<String> = errs.iter().map(ToString::to_string).collect();
+            errors.sort();
+            TransformError::Validation { index, errors }
+        })
+    }
 }
 
-// Implement Send + Sync so engine can be shared across threads safely
-// (DtoSchema is composed of String, HashMap, Vec — all Send+Sync)
-unsafe impl Send for DtoEngine {}
-unsafe impl Sync for DtoEngine {}
+fn tables_to_value(tables: HashMap<String, Vec<Value>>) -> Value {
+    Value::Object(
+        tables
+            .into_iter()
+            .map(|(table, rows)| (table, Value::Array(rows)))
+            .collect(),
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -598,5 +630,147 @@ mod tests {
         assert_eq!(processed, 15);
         assert_eq!(total_items, 15);
         assert_eq!(collected_chunks, 4); // 4 + 4 + 4 + 3
+    }
+
+    // ── Regression tests for previously silent failures ─────────────────
+
+    fn engine(json: &str) -> DtoEngine {
+        DtoEngine::from_json(json).unwrap()
+    }
+
+    fn load_error(json: &str) -> String {
+        match DtoEngine::from_json(json) {
+            Ok(_) => panic!("expected a load-time error for {json}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn array_with_one_bad_record_fails_and_names_it() {
+        let e = engine(r#"{"name":"T","mappings":[{"source":"id","target":"id"}],"required":["id"]}"#);
+        let err = e.transform(&json!([{ "id": 1 }, { "nope": 2 }, { "id": 3 }])).unwrap_err();
+        assert!(matches!(err, TransformError::Item { index: 1, .. }), "got {err}");
+        assert!(err.to_string().starts_with("item 1: required field 'id'"));
+    }
+
+    #[test]
+    fn validation_error_reports_original_index() {
+        let e = engine(
+            r#"{"name":"T","mappings":[{"source":"id","target":"id"},{"source":"age","target":"age"}],
+                "constraints":{"age":{"type":"number","max":150}}}"#,
+        );
+        let err = e
+            .transform(&json!([{ "id": 1, "age": 5 }, { "id": 2, "age": 7 }, { "id": 3, "age": 999 }]))
+            .unwrap_err();
+        assert!(matches!(err, TransformError::Validation { index: 2, .. }), "got {err}");
+        assert_eq!(err.to_string(), "validation error on item 2: field 'age': value 999 exceeds maximum 150");
+    }
+
+    #[test]
+    fn lowest_failing_index_is_reported_deterministically() {
+        let e = engine(r#"{"name":"T","mappings":[{"source":"id","target":"id"}],"required":["id"]}"#);
+        let mut items: Vec<Value> = (0..5000).map(|i| json!({ "id": i })).collect();
+        items[4000] = json!({});
+        items[1234] = json!({});
+        for _ in 0..5 {
+            let err = e.transform(&Value::Array(items.clone())).unwrap_err();
+            assert!(matches!(err, TransformError::Item { index: 1234, .. }));
+        }
+    }
+
+    #[test]
+    fn non_object_records_are_rejected() {
+        let e = engine(r#"{"name":"T","mappings":[{"source":"x","target":"y"}]}"#);
+        let err = e.transform(&json!([{ "x": 1 }, 2])).unwrap_err();
+        assert_eq!(err.to_string(), "item 1: expected a JSON object, got number");
+        assert!(e.transform(&json!("str")).is_err());
+    }
+
+    #[test]
+    fn chunked_and_streamed_errors_use_positions_in_the_full_input() {
+        let e = engine(r#"{"name":"T","mappings":[{"source":"id","target":"id"}],"required":["id"]}"#);
+        let mut items: Vec<Value> = (0..10).map(|i| json!({ "id": i })).collect();
+        items[7] = json!({});
+
+        let err = e.transform_chunks(&items, 3).unwrap_err();
+        assert!(matches!(err, TransformError::Item { index: 7, .. }), "got {err}");
+
+        let err = e.transform_stream(items, 3, |_| Ok(())).unwrap_err();
+        assert!(matches!(err, TransformError::Item { index: 7, .. }), "got {err}");
+    }
+
+    #[test]
+    fn batch_result_keeps_original_indices() {
+        let e = engine(
+            r#"{"name":"T","mappings":[{"source":"id","target":"id"},{"source":"age","target":"age"}],
+                "required":["id"],"constraints":{"age":{"max":10}}}"#,
+        );
+        let r = e.transform_batch(&[json!({ "age": 1 }), json!({ "id": 2, "age": 99 })]);
+        assert_eq!(r.indices, vec![1]);
+        assert_eq!(r.errors[0].0, 0);
+        assert_eq!(r.validation_errors[0].0, 1);
+    }
+
+    #[test]
+    fn configuration_mistakes_fail_at_load_time() {
+        assert!(load_error(r#"{"name":"T","mappings":[{"source":"x","target":"y","transform":"uppercsae"}]}"#)
+            .contains("uppercsae"));
+        assert!(load_error(r#"{"name":"T","mappings":[{"source":"a..b","target":"y"}]}"#).contains("a..b"));
+        assert!(load_error(r#"{"name":"T","mappings":[{"source":"a","target":"y"},{"source":"b","target":"y"}]}"#)
+            .contains("duplicate mapping target 'y'"));
+        assert!(load_error(
+            r#"{"type":"object","properties":{"a":{"type":"string","x-from":"a"}},"required":["zzz"]}"#
+        )
+        .contains("zzz"));
+        assert!(load_error(
+            r#"{"name":"T","mappings":[{"source":"a","target":"a"}],"constraints":{"a":{"type":"nubmer"}}}"#
+        )
+        .contains("unknown type 'nubmer'"));
+        assert!(load_error(
+            r#"{"name":"T","mappings":[{"source":"a","target":"a"}],"constraints":{"a":{"pattern":"^x$"}}}"#
+        )
+        .contains("'pattern' is not supported"));
+    }
+
+    #[test]
+    fn nested_recipe_without_explicit_type_is_applied() {
+        let e = engine(
+            r#"{"name":"T","mappings":[{"source":"user","target":"u",
+                 "nested":{"name":"N","mappings":[{"source":"name","target":"n"}]}}]}"#,
+        );
+        assert_eq!(e.transform(&json!({ "user": { "name": "Al", "x": 1 } })).unwrap(), json!({ "u": { "n": "Al" } }));
+    }
+
+    #[test]
+    fn json_schema_nested_object_without_x_from_reads_from_parent() {
+        let e = engine(
+            r#"{"type":"object","properties":{"addr":{"type":"object","required":["c"],
+                 "properties":{"c":{"type":"string","x-from":"city"}}}}}"#,
+        );
+        assert_eq!(e.transform(&json!({ "city": "X" })).unwrap(), json!({ "addr": { "c": "X" } }));
+        let err = e.transform(&json!({})).unwrap_err();
+        assert!(err.to_string().contains("'addr.c'"), "got {err}");
+    }
+
+    #[test]
+    fn date_cast_errors_instead_of_truncating() {
+        let e = engine(r#"{"name":"T","mappings":[{"source":"d","target":"d","cast":"date"}]}"#);
+        assert_eq!(e.transform(&json!({ "d": "2024-03-15T10:20:30Z" })).unwrap()["d"], "2024-03-15");
+        assert!(e.transform(&json!({ "d": "not a date" })).is_err());
+    }
+
+    #[test]
+    fn streaming_apis_reject_pipelines() {
+        let e = engine(r#"{"targets":[{"table":"t","mappings":[{"source":"k","target":"k"}]}]}"#);
+        assert!(e.is_pipeline());
+        let err = e.transform_stream(vec![json!({ "k": 1 })], 1, |_| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("not supported for pipelines"));
+        assert!(e.transform_chunks(&[json!({ "k": 1 })], 1).is_err());
+    }
+
+    #[test]
+    fn engine_is_send_and_sync_without_unsafe_impls() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<DtoEngine>();
     }
 }

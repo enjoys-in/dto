@@ -50,7 +50,21 @@ pub enum ValidationError {
 }
 
 /// Validate a single field value against its constraint.
+///
+/// When the constraint defines a custom `message`, it replaces the built-in
+/// error text.
 pub fn validate_field(
+    field_name: &str,
+    value: &Value,
+    constraint: &Constraint,
+) -> Result<(), ValidationError> {
+    check_field(field_name, value, constraint).map_err(|err| match constraint.message {
+        Some(ref message) => ValidationError::Custom(format!("field '{field_name}': {message}")),
+        None => err,
+    })
+}
+
+fn check_field(
     field_name: &str,
     value: &Value,
     constraint: &Constraint,
@@ -89,9 +103,9 @@ pub fn validate_field(
         }
     }
 
-    // Length check (strings and arrays)
+    // Length check (strings count characters, not UTF-8 bytes; arrays count items)
     let length = match value {
-        Value::String(s) => Some(s.len()),
+        Value::String(s) => Some(s.chars().count()),
         Value::Array(a) => Some(a.len()),
         _ => None,
     };
@@ -174,7 +188,12 @@ fn json_type_name(value: &Value) -> &'static str {
 fn type_matches(expected: &str, value: &Value) -> bool {
     match expected {
         "string" => value.is_string(),
-        "number" | "integer" => value.is_number(),
+        "number" => value.is_number(),
+        "integer" => {
+            value.is_i64()
+                || value.is_u64()
+                || value.as_f64().is_some_and(|f| f.is_finite() && f.fract() == 0.0)
+        }
         "boolean" | "bool" => value.is_boolean(),
         "array" => value.is_array(),
         "object" => value.is_object(),
@@ -257,5 +276,32 @@ mod tests {
         };
         assert!(validate_field("role", &json!("admin"), &c).is_ok());
         assert!(validate_field("role", &json!("guest"), &c).is_err());
+    }
+
+    #[test]
+    fn integer_type_rejects_fractions() {
+        let c = constraint(Some("integer"), None, None, None, None);
+        assert!(validate_field("n", &json!(3), &c).is_ok());
+        assert!(validate_field("n", &json!(3.0), &c).is_ok());
+        assert!(validate_field("n", &json!(2.5), &c).is_err());
+        assert!(validate_field("n", &json!("3"), &c).is_err());
+    }
+
+    #[test]
+    fn string_length_counts_characters_not_bytes() {
+        let c = constraint(Some("string"), None, None, None, Some(4));
+        // "José" is 4 characters but 5 UTF-8 bytes.
+        assert!(validate_field("name", &json!("José"), &c).is_ok());
+        assert!(validate_field("name", &json!("Josée"), &c).is_err());
+    }
+
+    #[test]
+    fn custom_message_replaces_default_text() {
+        let c = Constraint {
+            message: Some("must be an adult".into()),
+            ..constraint(Some("number"), Some(18.0), None, None, None)
+        };
+        let err = validate_field("age", &json!(12), &c).unwrap_err().to_string();
+        assert_eq!(err, "field 'age': must be an adult");
     }
 }

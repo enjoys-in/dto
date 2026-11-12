@@ -4,6 +4,7 @@
 //! either a **Recipe** or **JSON Schema** and processes data in parallel
 //! using Rayon. Zero-copy where possible, non-blocking batch processing.
 
+mod compiled;
 mod parallel;
 mod validator;
 mod unified;
