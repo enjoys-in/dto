@@ -15,17 +15,17 @@ crates/
 
 ## 1. `core/` (Core Engine Library)
 
-[`crates/core`](file:///f:/private/ENJOYS/DTO/crates/core) is the **heart of the project**. It is a pure, headless Rust library responsible for data parsing, navigation, transformation, and validation. It has zero WASM or CLI dependencies, meaning it can be embedded directly into any native Rust service or application.
+[`crates/core`](core) is the **heart of the project**. It is a pure, headless Rust library responsible for data parsing, navigation, transformation, and validation. It has zero WASM or CLI dependencies, meaning it can be embedded directly into any native Rust service or application.
 
 ### Internal Architecture
 
 | Module | Location | Responsibility |
 |---|---|---|
-| **Path** | [`crates/core/src/path/`](file:///f:/private/ENJOYS/DTO/crates/core/src/path) | Tokenizes and resolves dot-notation paths (`user.profile.name`, `orders[0].id`, `items[-1].sku`, `roles[*].name`). Includes AST, tokenizer with syntax checks, and a recursive JSON value resolver. |
-| **Recipe** | [`crates/core/src/recipe/`](file:///f:/private/ENJOYS/DTO/crates/core/src/recipe) | Handles the cooking-recipe format (`name`, `version`, `mappings`, `constraints`, `required`). Includes format auto-detection, inline pipe extraction, and compilation to schema AST. |
-| **Schema** | [`crates/core/src/schema/`](file:///f:/private/ENJOYS/DTO/crates/core/src/schema) | Standard JSON Schema model supporting `x-from` and `x-transform` annotations with recursive object mapping. |
-| **Functions** | [`crates/core/src/functions/`](file:///f:/private/ENJOYS/DTO/crates/core/src/functions) | 18 built-in transform functions with sequential chaining (`trim`, `lowercase`, `uppercase`, `to_string`, `to_number`, etc.). Automatically maps over array elements! |
-| **Engine** | [`crates/core/src/engine/`](file:///f:/private/ENJOYS/DTO/crates/core/src/engine) | **Rayon multi-threaded batch processing** for non-blocking parallel transformation of array items, unified `DtoEngine` interface, and constraint validator. |
+| **Path** | [`crates/core/src/path/`](core/src/path) | Tokenizes and resolves dot-notation paths (`user.profile.name`, `orders[0].id`, `items[-1].sku`, `roles[*].name`). Includes AST, tokenizer with syntax checks, and a recursive JSON value resolver. |
+| **Recipe** | [`crates/core/src/recipe/`](core/src/recipe) | Handles the cooking-recipe format (`name`, `version`, `mappings`, `constraints`, `required`). Includes format auto-detection, inline pipe extraction, and compilation to schema AST. |
+| **Schema** | [`crates/core/src/schema/`](core/src/schema) | Standard JSON Schema model supporting `x-from` and `x-transform` annotations with recursive object mapping. |
+| **Functions** | [`crates/core/src/functions/`](core/src/functions) | 18 built-in transform functions with sequential chaining (`trim`, `lowercase`, `uppercase`, `to_string`, `to_number`, etc.). Automatically maps over array elements! |
+| **Engine** | [`crates/core/src/engine/`](core/src/engine) | **Rayon multi-threaded batch processing** for non-blocking parallel transformation of array items, unified `DtoEngine` interface, and constraint validator. |
 
 ### How to Use in Native Rust
 
@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 2. `wasm/` (WebAssembly Interface)
 
-[`crates/wasm`](file:///f:/private/ENJOYS/DTO/crates/wasm) is the **bridge to the outside world**. It wraps `core` and compiles to a standalone WebAssembly (`.wasm`) binary (`wasm32-unknown-unknown`), enabling **Go**, **Python**, **JavaScript**, and **Java** to run the exact same Rust engine.
+[`crates/wasm`](wasm) is the **bridge to the outside world**. It wraps `core` and compiles to a standalone WebAssembly (`.wasm`) binary (`wasm32-unknown-unknown`), enabling **Go**, **Python**, **JavaScript**, and **Java** to run the exact same Rust engine.
 
 ### Key Characteristics
 
@@ -91,7 +91,7 @@ cargo build -p dto_wasm --target wasm32-unknown-unknown --release
 
 ## 3. `cli/` (Command-Line Interface)
 
-[`crates/cli`](file:///f:/private/ENJOYS/DTO/crates/cli) is a **standalone terminal executable** (`dto`) that provides a command-line interface to the engine. It is powered by `clap` and interacts directly with `core`.
+[`crates/cli`](cli) is a **standalone terminal executable** (`dto`) that provides a command-line interface to the engine. It is powered by `clap` and interacts directly with `core`.
 
 ### CLI Capabilities
 

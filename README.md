@@ -123,46 +123,10 @@ You can chain multiple transformations using either **pipe (`|`)**, **comma (`,`
 
 ---
 
-## 2. Enterprise Medallion Pipelines (Bronze → Silver Multi-Table ETL)
+## 2. Multi-Table Pipelines
 
-For enterprise data ingestion, the engine natively executes multi-target relational pipelines:
+A schema with a `targets` array is a pipeline: each input document can produce rows in several output tables.
 
-```json
-{
-  "sources": [
-    {
-      "id": "item",
-      "bronze_table": "stg_upload"
-    }
-  ],
-  "targets": [
-    {
-      "table": "silver_part",
-      "grain": "header",
-      "business_key": ["part_number"],
-      "dedup_strategy": "latest",
-      "mappings": [
-        { "source": "item_id", "target": "part_number", "cast": "string", "kind": "column" },
-        { "source": "reference.price", "target": "standard_cost", "cast": "decimal", "kind": "column" }
-      ]
-    },
-    {
-      "table": "silver_purchase_order_line",
-      "grain": "line",
-      "business_key": ["po_id", "extra_po_line_key"],
-      "dedup_strategy": "latest",
-      "mappings": [
-        { "source": "item_id", "target": "part_number", "cast": "string", "kind": "column" },
-        { "source": "transactions[*].purchaseOrderId", "target": "po_id", "cast": "string", "unpack": "array_explode" },
-        { "source": "transactions[*].quantity", "target": "quantity", "cast": "decimal", "unpack": "array_explode" },
-        { "source": "transactions[*]", "target": "flex_attributes", "cast": "json", "unpack": "array_explode" }
-      ]
-    }
-  ]
-}
-```
-
-### Medallion Engine Capabilities:
 1. **Multi-Table Fan-Out**: Automatically routes one incoming Bronze document into multiple distinct Silver tables.
 2. **`unpack: "array_explode"`**: Unrolls nested arrays into individual rows while automatically **broadcasting parent fields** (e.g. `item_id`) down to each line item.
 3. **Deduplication (`dedup_strategy: "latest"`)**: Groups rows by their `business_key` and keeps one row per key. Set `sequence_by` (alias `order_by`) to an output column to keep the row with the greatest value. Numbers compare numerically and strings lexicographically, so ISO-8601 timestamps sort correctly when they share one offset; ties go to the later row. Without `sequence_by`, the **last row in input order** wins. Rows whose key column is missing or null are never merged. `business_key` and `sequence_by` must name columns that a mapping produces.
