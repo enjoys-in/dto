@@ -1,0 +1,612 @@
+{
+  "sources": [
+    {
+      "id": "item",
+      "bronze_table": "stg_upload",
+      "filters": {
+        "source_system": "api_ingest",
+        "source_entity": "part"
+      }
+    }
+  ],
+  "targets": [
+    {
+      "table": "silver_part",
+      "source_id": "item",
+      "grain": "header",
+      "business_key": [
+        "part_number"
+      ],
+      "dedup_strategy": "latest",
+      "mappings": [
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "item_id",
+          "target": "part_number"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "revision_number",
+          "target": "revision_number"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "reference.name",
+          "target": "description_short"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "reference.description",
+          "target": "description_long"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "reference.uom",
+          "target": "unit_of_measure"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "reference.category",
+          "target": "commodity_id"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "reference.hsn",
+          "target": "hts_code"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "reference.brand",
+          "target": "manufacturer_name"
+        },
+        {
+          "cast": "decimal",
+          "kind": "column",
+          "source": "reference.price",
+          "target": "standard_cost"
+        },
+        {
+          "cast": "string",
+          "kind": "extension",
+          "source": "reference.subcategory",
+          "target": "flex_text_1"
+        },
+        {
+          "cast": "string",
+          "kind": "extension",
+          "source": "reference.sku_product_code",
+          "target": "flex_text_2"
+        },
+        {
+          "cast": "string",
+          "kind": "extension",
+          "source": "reference.price_uom",
+          "target": "flex_text_3"
+        },
+        {
+          "cast": "decimal",
+          "kind": "extension",
+          "source": "reference.mrp",
+          "target": "flex_num_1"
+        },
+        {
+          "cast": "decimal",
+          "kind": "extension",
+          "source": "reference.tax",
+          "target": "flex_num_2"
+        }
+      ],
+      "contract": {
+        "types": {},
+        "nullable": [],
+        "required": [
+          "item_id"
+        ],
+        "constraints": [],
+        "drift_watch": []
+      }
+    },
+    {
+      "table": "silver_purchase_order",
+      "source_id": "item",
+      "grain": "line",
+      "business_key": [
+        "po_id"
+      ],
+      "dedup_strategy": "latest",
+      "mappings": [
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].purchaseOrderId",
+          "target": "po_id",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].purchaseOrderId",
+          "target": "po_number",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].supplierId",
+          "target": "supplier_id",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].outletId",
+          "target": "company_site_id",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "date",
+          "kind": "column",
+          "source": "transactions[*].purchaseOrderDateIST",
+          "target": "ordered_date",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "column",
+          "source": "transactions[*].totalAmount",
+          "target": "total_amount",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "extension",
+          "source": "transactions[*].deliveryCharges",
+          "target": "flex_num_1",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "extension",
+          "source": "transactions[*].deliveryChargesTax",
+          "target": "flex_num_2",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "extension",
+          "source": "transactions[*].poDiscountAmount",
+          "target": "flex_num_3",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "extension",
+          "source": "transactions[*].additionalChargesAmount",
+          "target": "flex_num_4",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "extension",
+          "source": "transactions[*].taxAmount",
+          "target": "flex_num_5",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "extension",
+          "source": "transactions[*].subTotalAmount",
+          "target": "flex_num_6",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "extension",
+          "source": "transactions[*].poDiscountType",
+          "target": "flex_text_1",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "extension",
+          "source": "transactions[*].additionalChargesType",
+          "target": "flex_text_2",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "extension",
+          "source": "transactions[*].pickupAddressCity",
+          "target": "flex_text_3",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "extension",
+          "source": "transactions[*].pickupAddressState",
+          "target": "flex_text_4",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "extension",
+          "source": "transactions[*].buyerBillingAddressCity",
+          "target": "flex_text_5",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "extension",
+          "source": "transactions[*].buyerBillingAddressState",
+          "target": "flex_text_6",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "timestamp",
+          "kind": "extension",
+          "source": "transactions[*].purchaseOrderDateIST",
+          "target": "flex_ts_1",
+          "unpack": "array_explode"
+        }
+      ],
+      "contract": {
+        "types": {},
+        "nullable": [],
+        "required": [
+          "item_id"
+        ],
+        "constraints": [],
+        "drift_watch": []
+      }
+    },
+    {
+      "table": "silver_purchase_order_line",
+      "source_id": "item",
+      "grain": "line",
+      "business_key": [
+        "po_id",
+        "extra_po_line_key"
+      ],
+      "dedup_strategy": "latest",
+      "mappings": [
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].purchaseOrderId",
+          "target": "po_id",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].productCartId",
+          "target": "extra_po_line_key",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "item_id",
+          "target": "part_number"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "revision_number",
+          "target": "revision_number"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].productTitle",
+          "target": "description",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "reference.category",
+          "target": "commodity_id"
+        },
+        {
+          "cast": "decimal",
+          "kind": "column",
+          "source": "transactions[*].quantity",
+          "target": "quantity",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "column",
+          "source": "transactions[*].price",
+          "target": "unit_price",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "column",
+          "source": "transactions[*].lineSubTotal",
+          "target": "line_subtotal",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "column",
+          "source": "transactions[*].lineTaxAmount",
+          "target": "tax_amount",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "column",
+          "source": "transactions[*].lineTotalAmount",
+          "target": "total_amount",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "column",
+          "source": "transactions[*].totalAmount",
+          "target": "po_total_amount",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "reference.uom",
+          "target": "unit_of_measure"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "reference.hsn",
+          "target": "hts_code"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "reference.brand",
+          "target": "manufacturer_name"
+        },
+        {
+          "cast": "decimal",
+          "kind": "column",
+          "source": "reference.price",
+          "target": "standard_cost"
+        },
+        {
+          "cast": "string",
+          "kind": "extension",
+          "source": "transactions[*].discountType",
+          "target": "flex_text_1",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "extension",
+          "source": "transactions[*].productPackagingType",
+          "target": "flex_text_2",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "extension",
+          "source": "transactions[*].itemDiscount",
+          "target": "flex_num_1",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "extension",
+          "source": "transactions[*].lineGstPercentage",
+          "target": "flex_num_2",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "extension",
+          "source": "transactions[*].productGstPercentage",
+          "target": "flex_num_3",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "extension",
+          "source": "transactions[*].productCess",
+          "target": "flex_num_4",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "extension",
+          "source": "transactions[*].unitPriceWithoutTax",
+          "target": "flex_num_5",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "decimal",
+          "kind": "extension",
+          "source": "transactions[*].unitPriceWithTax",
+          "target": "flex_num_6",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "json",
+          "kind": "extension",
+          "source": "transactions[*]",
+          "target": "flex_attributes",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "boolean",
+          "kind": "extension",
+          "source": "transactions[*].isCapex",
+          "target": "flex_bool_1",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "boolean",
+          "kind": "extension",
+          "source": "transactions[*].isKitchenItem",
+          "target": "flex_bool_2",
+          "unpack": "array_explode"
+        }
+      ],
+      "contract": {
+        "types": {},
+        "nullable": [],
+        "required": [
+          "item_id"
+        ],
+        "constraints": [],
+        "drift_watch": []
+      }
+    },
+    {
+      "table": "silver_supplier",
+      "source_id": "item",
+      "grain": "line",
+      "business_key": [
+        "supplier_id"
+      ],
+      "dedup_strategy": "latest",
+      "mappings": [
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].supplierId",
+          "target": "supplier_id",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].supplierName",
+          "target": "supplier_name",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].sellerBillingAddressCity",
+          "target": "headquarters_city",
+          "unpack": "array_explode"
+        }
+      ],
+      "contract": {
+        "types": {},
+        "nullable": [],
+        "required": [
+          "item_id"
+        ],
+        "constraints": [],
+        "drift_watch": []
+      }
+    },
+    {
+      "table": "silver_company_site",
+      "source_id": "item",
+      "grain": "line",
+      "business_key": [
+        "site_id"
+      ],
+      "dedup_strategy": "latest",
+      "mappings": [
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].outletId",
+          "target": "site_id",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].outletCity",
+          "target": "city",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].outletState",
+          "target": "state_province",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].customerId",
+          "target": "company_level_0",
+          "unpack": "array_explode"
+        }
+      ],
+      "contract": {
+        "types": {},
+        "nullable": [],
+        "required": [
+          "item_id"
+        ],
+        "constraints": [],
+        "drift_watch": []
+      }
+    },
+    {
+      "table": "silver_supplier_location",
+      "source_id": "item",
+      "grain": "line",
+      "business_key": [
+        "supplier_location_id"
+      ],
+      "dedup_strategy": "latest",
+      "mappings": [
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].supplierId",
+          "target": "supplier_location_id",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].supplierId",
+          "target": "supplier_id",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].sellerBillingAddressCity",
+          "target": "city",
+          "unpack": "array_explode"
+        },
+        {
+          "cast": "string",
+          "kind": "column",
+          "source": "transactions[*].sellerBillingAddressState",
+          "target": "state_province",
+          "unpack": "array_explode"
+        }
+      ],
+      "contract": {
+        "types": {},
+        "nullable": [],
+        "required": [
+          "item_id"
+        ],
+        "constraints": [],
+        "drift_watch": []
+      }
+    }
+  ],
+  "table_first": false
+}

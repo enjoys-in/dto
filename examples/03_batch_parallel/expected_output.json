@@ -1,0 +1,5 @@
+[
+  { "userId": "USR-001", "email": "alice@example.com", "status": "ACTIVE" },
+  { "userId": "USR-002", "email": "bob@company.org", "status": "PENDING" },
+  { "userId": "USR-003", "email": "charlie@dev.io", "status": "VERIFIED" }
+]

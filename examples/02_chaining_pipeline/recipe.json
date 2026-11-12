@@ -1,0 +1,14 @@
+{
+  "name": "CleanCustomerDTO",
+  "version": "1.0.0",
+  "mappings": [
+    { "source": "customer.full_name | trim | lowercase", "target": "cleanName" },
+    { "source": "customer.phone_number | to_string | trim", "target": "phoneStr" },
+    { "source": "customer.loyalty_score | trim | to_number", "target": "numericScore" },
+    { "source": "customer.interests[*]", "target": "topics", "transform": "trim | uppercase" }
+  ],
+  "constraints": {
+    "numericScore": { "type": "number", "min": 0, "max": 100 }
+  },
+  "required": ["cleanName", "phoneStr"]
+}

@@ -1,0 +1,22 @@
+{
+  "account": {
+    "user_id": "usr_99824",
+    "profile": {
+      "first_name": "Jane",
+      "last_name": "Doe",
+      "location": {
+        "city": "San Francisco",
+        "state": "CA",
+        "country": "USA"
+      }
+    },
+    "contact": {
+      "emails": ["jane.doe@example.com", "jdoe@work.org"],
+      "phone": "+1-555-0199"
+    },
+    "membership": {
+      "tier": "enterprise",
+      "active": true
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "fullName": {
+      "type": "string",
+      "x-from": "user.name | trim | lowercase"
+    },
+    "city": {
+      "type": "string",
+      "x-from": "user.address.city"
+    },
+    "score": {
+      "type": "number",
+      "x-from": "user.score",
+      "x-transform": "to_number"
+    }
+  },
+  "required": ["fullName"]
+}

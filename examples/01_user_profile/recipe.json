@@ -1,0 +1,17 @@
+{
+  "name": "UserSummaryDTO",
+  "version": "1.0.0",
+  "mappings": [
+    { "source": "account.user_id", "target": "id" },
+    { "source": "account.profile.first_name", "target": "firstName" },
+    { "source": "account.profile.last_name", "target": "lastName" },
+    { "source": "account.profile.location.city", "target": "city" },
+    { "source": "account.contact.emails[0]", "target": "primaryEmail" },
+    { "source": "account.membership.tier", "target": "tier", "transform": "uppercase" }
+  ],
+  "constraints": {
+    "id": { "type": "string", "min_length": 1 },
+    "primaryEmail": { "type": "string" }
+  },
+  "required": ["id", "firstName", "primaryEmail"]
+}

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dto-wasm"
+version = "0.1.0"
+description = "High-performance DTO data transformation engine powered by WebAssembly"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "wasmtime>=12.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.setuptools.package-data]
+dto = ["*.wasm"]

@@ -1,0 +1,20 @@
+[package]
+name = "dto_core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rayon = "1"                           # Data-parallel batch transforms
+smallvec = { version = "1", features = ["serde"] }  # Stack-alloc for small path segments
+compact_str = { version = "0.8", features = ["serde"] }  # Small-string optimization
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+pretty_assertions = "1"
+
+[[bench]]
+name = "transform_bench"
+harness = false

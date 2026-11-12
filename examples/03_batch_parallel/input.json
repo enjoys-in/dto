@@ -1,0 +1,5 @@
+[
+  { "id": "USR-001", "profile": { "email": " ALICE@EXAMPLE.COM " }, "status": "active" },
+  { "id": "USR-002", "profile": { "email": " BOB@COMPANY.ORG " }, "status": "pending" },
+  { "id": "USR-003", "profile": { "email": " CHARLIE@DEV.IO " }, "status": "verified" }
+]

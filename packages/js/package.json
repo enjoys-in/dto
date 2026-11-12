@@ -1,0 +1,20 @@
+{
+  "name": "dto-wasm",
+  "version": "0.1.0",
+  "description": "High-performance DTO data transformation engine powered by Rust and WebAssembly",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "dto",
+    "transform",
+    "wasm",
+    "json-schema",
+    "mapping"
+  ],
+  "author": "",
+  "license": "MIT OR Apache-2.0"
+}

@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  rust-and-wasm:
+    name: Rust & WebAssembly Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cargo Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run Cargo Tests
+        run: cargo test --workspace
+
+      - name: Build WebAssembly Release
+        run: cargo build -p dto_wasm --target wasm32-unknown-unknown --release
+
+      - name: Distribute WASM to Packages
+        run: |
+          cp target/wasm32-unknown-unknown/release/dto_wasm.wasm packages/go/dto.wasm
+          cp target/wasm32-unknown-unknown/release/dto_wasm.wasm packages/python/dto/dto.wasm
+          cp target/wasm32-unknown-unknown/release/dto_wasm.wasm packages/js/dto.wasm
+          cp target/wasm32-unknown-unknown/release/dto_wasm.wasm packages/java/src/main/resources/dto.wasm
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dto-wasm
+          path: target/wasm32-unknown-unknown/release/dto_wasm.wasm
+
+  sdk-go:
+    name: Go SDK (Wazero pure WASM)
+    needs: rust-and-wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - uses: actions/download-artifact@v4
+        with:
+          name: dto-wasm
+          path: packages/go/
+      - name: Rename to dto.wasm
+        run: mv packages/go/dto_wasm.wasm packages/go/dto.wasm
+      - name: Test Go SDK
+        working-directory: packages/go
+        run: go test -v ./...
+
+  sdk-python:
+    name: Python SDK (wasmtime)
+    needs: rust-and-wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          name: dto-wasm
+          path: packages/python/dto/
+      - name: Rename to dto.wasm
+        run: mv packages/python/dto/dto_wasm.wasm packages/python/dto/dto.wasm
+      - name: Install dependencies & Test
+        working-directory: packages/python
+        run: |
+          pip install wasmtime pytest
+          PYTHONPATH=. pytest -v
+
+  sdk-js:
+    name: JavaScript SDK (Node.js)
+    needs: rust-and-wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/download-artifact@v4
+        with:
+          name: dto-wasm
+          path: packages/js/
+      - name: Rename to dto.wasm
+        run: mv packages/js/dto_wasm.wasm packages/js/dto.wasm
+      - name: Test JS SDK
+        working-directory: packages/js
+        run: node --test

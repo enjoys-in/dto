@@ -1,0 +1,10 @@
+{
+  "name": "ParallelBatchDTO",
+  "version": "1.0.0",
+  "mappings": [
+    { "source": "id", "target": "userId" },
+    { "source": "profile.email", "target": "email", "transform": "trim | lowercase" },
+    { "source": "status", "target": "status", "transform": "uppercase" }
+  ],
+  "required": ["userId", "email"]
+}
